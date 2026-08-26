@@ -1,0 +1,798 @@
+package main
+
+import (
+	"encoding/json"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"reflect"
+	"strings"
+	"testing"
+
+	"agent-graph/testkit"
+)
+
+func TestCommandRuns(t *testing.T) {
+	command := exec.Command("go", "run", ".")
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run command: %v\n%s", err, output)
+	}
+}
+
+func TestCommandHelpListsPublicCommands(t *testing.T) {
+	standardOutput := &strings.Builder{}
+	standardError := &strings.Builder{}
+
+	if exitCode := run([]string{"--help"}, standardOutput, standardError); exitCode != 0 {
+		t.Fatalf("run help command: exit code %d, error %s", exitCode, standardError.String())
+	}
+
+	output := standardOutput.String()
+	for _, command := range []string{"index", "query", "path", "explain", "export", "indexer", "benchmark"} {
+		if !strings.Contains(output, command) {
+			t.Errorf("help output = %q, want public command %q", output, command)
+		}
+	}
+}
+
+func TestIndexCommandHelpListsItsFlags(t *testing.T) {
+	standardOutput := &strings.Builder{}
+	standardError := &strings.Builder{}
+
+	if exitCode := run([]string{"index", "--help"}, standardOutput, standardError); exitCode != 0 {
+		t.Fatalf("run index help command: exit code %d, error %s", exitCode, standardError.String())
+	}
+
+	if output := standardOutput.String(); !strings.Contains(output, "--database") {
+		t.Errorf("index help output = %q, want database flag", output)
+	}
+}
+
+func TestIndexerCommandHelpListsItsActions(t *testing.T) {
+	standardOutput := &strings.Builder{}
+	standardError := &strings.Builder{}
+
+	if exitCode := run([]string{"indexer", "--help"}, standardOutput, standardError); exitCode != 0 {
+		t.Fatalf("run indexer help command: exit code %d, error %s", exitCode, standardError.String())
+	}
+
+	output := standardOutput.String()
+	for _, action := range []string{"serve", "start", "status", "stop"} {
+		if !strings.Contains(output, action) {
+			t.Errorf("indexer help output = %q, want action %q", output, action)
+		}
+	}
+}
+
+func TestCommandRejectsUnsupportedOutputFormat(t *testing.T) {
+	standardOutput := &strings.Builder{}
+	standardError := &strings.Builder{}
+
+	if exitCode := run([]string{"--format", "yaml"}, standardOutput, standardError); exitCode != 2 {
+		t.Errorf("exit code = %d, want 2", exitCode)
+	}
+}
+
+func TestBenchmarkCommandMeasuresCriticalUserPath(t *testing.T) {
+	output := &strings.Builder{}
+	standardError := &strings.Builder{}
+	if exitCode := run([]string{"benchmark", "--format", "json", "--source-files", "3", "--functions-per-file", "4"}, output, standardError); exitCode != 0 {
+		t.Fatalf("run benchmark command: exit code %d, error %s", exitCode, standardError.String())
+	}
+
+	var result struct {
+		GraphVersion int    `json:"graphVersion"`
+		PublishedAt  string `json:"publishedAt"`
+		Result       struct {
+			Measurements []struct {
+				Name       string `json:"name"`
+				DurationNS int64  `json:"durationNs"`
+			} `json:"measurements"`
+			PhaseMeasurements []struct {
+				Name       string `json:"name"`
+				DurationNS int64  `json:"durationNs"`
+			} `json:"phaseMeasurements"`
+			ResolverMeasurements []struct {
+				Name       string `json:"name"`
+				DurationNS int64  `json:"durationNs"`
+			} `json:"resolverMeasurements"`
+			SQLiteWriteMeasurements []struct {
+				Name       string `json:"name"`
+				DurationNS int64  `json:"durationNs"`
+			} `json:"sqliteWriteMeasurements"`
+			Runs []struct {
+				Measurements []struct {
+					Name       string `json:"name"`
+					DurationNS int64  `json:"durationNs"`
+				} `json:"measurements"`
+				PhaseMeasurements []struct {
+					Name       string `json:"name"`
+					DurationNS int64  `json:"durationNs"`
+				} `json:"phaseMeasurements"`
+				ResolverMeasurements []struct {
+					Name       string `json:"name"`
+					DurationNS int64  `json:"durationNs"`
+				} `json:"resolverMeasurements"`
+				SQLiteWriteMeasurements []struct {
+					Name       string `json:"name"`
+					DurationNS int64  `json:"durationNs"`
+				} `json:"sqliteWriteMeasurements"`
+				PeakRSSBytes   uint64 `json:"peakRssBytes"`
+				DatabaseBytes  int64  `json:"databaseBytes"`
+				OutputChecksum string `json:"outputChecksum"`
+			} `json:"runs"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal([]byte(output.String()), &result); err != nil {
+		t.Fatalf("decode benchmark result: %v\n%s", err, output.String())
+	}
+	if result.GraphVersion != 2 || result.PublishedAt == "" {
+		t.Errorf("benchmark metadata = {%d, %q}, want published graph metadata", result.GraphVersion, result.PublishedAt)
+	}
+	if len(result.Result.Measurements) != 5 {
+		t.Fatalf("measurements = %+v, want five critical-path measurements", result.Result.Measurements)
+	}
+	for index, want := range []string{"initial_index", "incremental_update", "query", "path", "explain"} {
+		measurement := result.Result.Measurements[index]
+		if measurement.Name != want {
+			t.Errorf("measurement %d name = %q, want %q", index, measurement.Name, want)
+		}
+		if measurement.DurationNS < 0 {
+			t.Errorf("measurement %q duration = %d, want non-negative", measurement.Name, measurement.DurationNS)
+		}
+	}
+	for runIndex, run := range result.Result.Runs {
+		if len(run.PhaseMeasurements) != 5 {
+			t.Fatalf("run %d phase measurements = %+v, want five indexing phases", runIndex, run.PhaseMeasurements)
+		}
+		for phaseIndex, want := range []string{"extraction", "resolution", "publication_preparation", "sqlite_write", "commit"} {
+			measurement := run.PhaseMeasurements[phaseIndex]
+			if measurement.Name != want {
+				t.Errorf("run %d phase measurement %d name = %q, want %q", runIndex, phaseIndex, measurement.Name, want)
+			}
+			if measurement.DurationNS < 0 {
+				t.Errorf("run %d phase %q duration = %d, want non-negative", runIndex, measurement.Name, measurement.DurationNS)
+			}
+		}
+		if len(run.ResolverMeasurements) != 3 {
+			t.Fatalf("run %d resolver measurements = %+v, want three incremental resolver measurements", runIndex, run.ResolverMeasurements)
+		}
+		for measurementIndex, want := range []string{"affected_source_selection", "contribution_restoration", "workspace_resolution"} {
+			measurement := run.ResolverMeasurements[measurementIndex]
+			if measurement.Name != want {
+				t.Errorf("run %d resolver measurement %d name = %q, want %q", runIndex, measurementIndex, measurement.Name, want)
+			}
+			if measurement.DurationNS < 0 {
+				t.Errorf("run %d resolver measurement %q duration = %d, want non-negative", runIndex, measurement.Name, measurement.DurationNS)
+			}
+		}
+	}
+	if len(result.Result.ResolverMeasurements) != 3 {
+		t.Fatalf("resolver medians = %+v, want three incremental resolver measurements", result.Result.ResolverMeasurements)
+	}
+	writeTables := []string{
+		"workspace_nodes",
+		"workspace_edges",
+		"file_contributions",
+		"contribution_nodes",
+		"contribution_edges",
+		"contribution_extensions",
+		"contribution_dependencies",
+		"contribution_exported_surfaces",
+		"contribution_diagnostics",
+		"contribution_unresolved_references",
+		"contribution_module_bindings",
+		"contribution_symbol_references",
+	}
+	if len(result.Result.SQLiteWriteMeasurements) != len(writeTables) {
+		t.Fatalf("SQLite write medians = %+v, want %d table measurements", result.Result.SQLiteWriteMeasurements, len(writeTables))
+	}
+	for measurementIndex, want := range writeTables {
+		measurement := result.Result.SQLiteWriteMeasurements[measurementIndex]
+		if measurement.Name != want {
+			t.Errorf("SQLite write median %d name = %q, want %q", measurementIndex, measurement.Name, want)
+		}
+		if measurement.DurationNS < 0 {
+			t.Errorf("SQLite write median %q duration = %d, want non-negative", measurement.Name, measurement.DurationNS)
+		}
+	}
+	if len(result.Result.Runs) != benchmarkRuns {
+		t.Fatalf("warm runs = %+v, want %d", result.Result.Runs, benchmarkRuns)
+	}
+	for runIndex, run := range result.Result.Runs {
+		if len(run.Measurements) != 5 || run.PeakRSSBytes == 0 || run.DatabaseBytes <= 0 || run.OutputChecksum == "" {
+			t.Errorf("warm run %d = %+v, want measurements and resource metadata", runIndex, run)
+		}
+		if len(run.SQLiteWriteMeasurements) != len(writeTables) {
+			t.Errorf("warm run %d SQLite write measurements = %+v, want %d table measurements", runIndex, run.SQLiteWriteMeasurements, len(writeTables))
+		}
+	}
+	if progress := standardError.String(); !strings.Contains(progress, "Benchmark setup: generated 3/3 source files") || !strings.Contains(progress, "Benchmark setup: validation extract 3/3 sources") || !strings.Contains(progress, "Benchmark setup: validation resolve 3/3 sources") || !strings.Contains(progress, "Benchmark setup: validation publish 3/3 sources") || !strings.Contains(progress, "Benchmark setup: validated 16/16 nodes and 30/30 edges") || !strings.Contains(progress, "Benchmark run 1/1: complete") {
+		t.Errorf("benchmark progress = %q, want setup counts and run completion messages", progress)
+	}
+}
+
+func TestBenchmarkCommandWritesInitialIndexCPUProfile(t *testing.T) {
+	profilePath := filepath.Join(t.TempDir(), "initial-index.pprof")
+	output := &strings.Builder{}
+	standardError := &strings.Builder{}
+
+	if exitCode := run([]string{"benchmark", "--source-files", "3", "--functions-per-file", "4", "--cpu-profile", profilePath}, output, standardError); exitCode != 0 {
+		t.Fatalf("run benchmark with CPU profile: exit code %d, error %s", exitCode, standardError.String())
+	}
+
+	profile, err := os.Stat(profilePath)
+	if err != nil {
+		t.Fatalf("stat CPU profile: %v", err)
+	}
+	if profile.Size() == 0 {
+		t.Error("CPU profile is empty")
+	}
+}
+
+func TestBenchmarkCommandMeasuresGoWorkspace(t *testing.T) {
+	workspace := testkit.NewWorkspace(t, map[string]string{
+		".agraphignore":    "reference/\n",
+		"go.mod":           "module example.com/fixture\n\ngo 1.24\n",
+		"cmd/main.go":      "package main\n\nimport \"example.com/fixture/service\"\n\nfunc main() { service.Run() }\n",
+		"service/run.go":   "package service\n\nfunc Run() {}\n",
+		"reference/api.ts": "export function incompatible(name: string): string { return \"\"; }\n",
+	})
+	updatePath := filepath.Join(workspace.Root, "cmd", "main.go")
+	baseline, err := os.ReadFile(updatePath)
+	if err != nil {
+		t.Fatalf("read workspace source baseline: %v", err)
+	}
+	output := &strings.Builder{}
+	standardError := &strings.Builder{}
+
+	if exitCode := run([]string{"benchmark", "--format", "json", workspace.Root}, output, standardError); exitCode != 0 {
+		t.Fatalf("run Go workspace benchmark: exit code %d, error %s", exitCode, standardError.String())
+	}
+
+	var result struct {
+		Result struct {
+			Runs []struct {
+				OutputChecksum string `json:"outputChecksum"`
+			} `json:"runs"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal([]byte(output.String()), &result); err != nil {
+		t.Fatalf("decode Go workspace benchmark result: %v\n%s", err, output.String())
+	}
+	if len(result.Result.Runs) != benchmarkRuns {
+		t.Errorf("benchmark runs = %+v, want %d workspace measurements", result.Result.Runs, benchmarkRuns)
+	}
+	for runIndex, run := range result.Result.Runs {
+		if run.OutputChecksum == "" {
+			t.Errorf("benchmark run %d has no output checksum", runIndex)
+		}
+	}
+	contents, err := os.ReadFile(updatePath)
+	if err != nil {
+		t.Fatalf("read benchmarked workspace source: %v", err)
+	}
+	if string(contents) != string(baseline) {
+		t.Errorf("benchmarked workspace source changed\ngot:  %q\nwant: %q", contents, baseline)
+	}
+	if progress := standardError.String(); !strings.Contains(progress, "Benchmark setup: measure 2 workspace source files") {
+		t.Errorf("benchmark progress = %q, want ignored source exclusion", progress)
+	}
+}
+
+func TestBenchmarkCommandRejectsWorkspaceWithoutSources(t *testing.T) {
+	workspace := testkit.NewWorkspace(t, map[string]string{
+		"README.md": "No source files.\n",
+	})
+	output := &strings.Builder{}
+	standardError := &strings.Builder{}
+
+	if exitCode := run([]string{"benchmark", workspace.Root}, output, standardError); exitCode != 2 {
+		t.Errorf("exit code = %d, want 2", exitCode)
+	}
+	if errorOutput := standardError.String(); !strings.Contains(errorOutput, "no supported source files") {
+		t.Errorf("error = %q, want missing source files message", errorOutput)
+	}
+}
+
+func TestBenchmarkCommandRejectsNonpositiveCorpusSize(t *testing.T) {
+	output := &strings.Builder{}
+	standardError := &strings.Builder{}
+
+	if exitCode := run([]string{"benchmark", "--source-files", "0"}, output, standardError); exitCode != 2 {
+		t.Errorf("benchmark invalid source file count exit code = %d, want 2", exitCode)
+	}
+	if !strings.Contains(standardError.String(), "must be positive") {
+		t.Errorf("benchmark invalid source file count error = %q, want validation error", standardError.String())
+	}
+}
+
+func TestIndexCommandPublishesWorkspaceGraph(t *testing.T) {
+	workspace := testkit.NewWorkspace(t, map[string]string{
+		"package.json": `{"name":"fixture"}`,
+		"src/main.ts":  "export function main() { return 1; }",
+	})
+	database := filepath.Join(t.TempDir(), "state", "graph.db")
+
+	command := exec.Command("go", "run", ".", "index", "--database", database, "--format", "json", workspace.Root)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run index command: %v\n%s", err, output)
+	}
+
+	var result struct {
+		GraphVersion int    `json:"graphVersion"`
+		PublishedAt  string `json:"publishedAt"`
+		Result       struct {
+			Workspace string `json:"workspace"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(output, &result); err != nil {
+		t.Fatalf("decode index result: %v\n%s", err, output)
+	}
+	if result.GraphVersion != 1 {
+		t.Errorf("graph version = %d, want 1", result.GraphVersion)
+	}
+	if result.PublishedAt == "" {
+		t.Error("published time is empty")
+	}
+	if result.Result.Workspace != workspace.Root {
+		t.Errorf("workspace = %q, want %q", result.Result.Workspace, workspace.Root)
+	}
+	if _, err := os.Stat(database); err != nil {
+		t.Errorf("database %q does not exist: %v", database, err)
+	}
+}
+
+func TestIndexCommandUsesWorkspaceLocalDatabaseByDefault(t *testing.T) {
+	workspace := testkit.NewWorkspace(t, map[string]string{
+		"package.json": `{"name":"fixture"}`,
+		"src/main.ts":  "export function main() { return 1; }",
+	})
+
+	command := exec.Command("go", "run", ".", "index", workspace.Root)
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run index command: %v\n%s", err, output)
+	}
+
+	database := filepath.Join(workspace.Root, ".agent-graph", "graph.db")
+	if _, err := os.Stat(database); err != nil {
+		t.Errorf("default database %q does not exist: %v", database, err)
+	}
+}
+
+func TestExportCommandWritesPublishedGraphAsJSON(t *testing.T) {
+	workspace := testkit.NewWorkspace(t, map[string]string{
+		"package.json":  `{"name":"fixture"}`,
+		"src/helper.ts": "export function helper() { return 1; }",
+		"src/main.ts":   "import { helper } from './helper'; export function main() { return helper(); }",
+	})
+	database := filepath.Join(t.TempDir(), "state", "graph.db")
+
+	indexCommand := exec.Command("go", "run", ".", "index", "--database", database, workspace.Root)
+	if output, err := indexCommand.CombinedOutput(); err != nil {
+		t.Fatalf("run index command: %v\n%s", err, output)
+	}
+	workingDirectory, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("read working directory: %v", err)
+	}
+	relativeWorkspace, err := filepath.Rel(workingDirectory, workspace.Root)
+	if err != nil {
+		t.Fatalf("resolve relative workspace: %v", err)
+	}
+
+	exportCommand := exec.Command("go", "run", ".", "export", "--database", database, "--format", "json", relativeWorkspace)
+	output, err := exportCommand.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run export command: %v\n%s", err, output)
+	}
+
+	var result struct {
+		GraphVersion int    `json:"graphVersion"`
+		PublishedAt  string `json:"publishedAt"`
+		Result       struct {
+			Nodes []struct {
+				ID       string `json:"id"`
+				Evidence any    `json:"evidence"`
+			} `json:"nodes"`
+			Edges []struct {
+				Relation string `json:"relation"`
+				Evidence any    `json:"evidence"`
+			} `json:"edges"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(output, &result); err != nil {
+		t.Fatalf("decode export result: %v\n%s", err, output)
+	}
+	var schema map[string]any
+	if err := json.Unmarshal(output, &schema); err != nil {
+		t.Fatalf("decode export schema: %v\n%s", err, output)
+	}
+	resultData := schema["result"].(map[string]any)
+	nodes := resultData["nodes"].([]any)
+	firstNode := nodes[0].(map[string]any)
+	if _, exists := firstNode["id"]; !exists {
+		t.Errorf("exported node fields = %v, want lower-camel-case id", firstNode)
+	}
+	if _, exists := firstNode["ID"]; exists {
+		t.Errorf("exported node fields = %v, do not want upper-case ID", firstNode)
+	}
+	if result.GraphVersion != 1 {
+		t.Errorf("graph version = %d, want 1", result.GraphVersion)
+	}
+	if result.PublishedAt == "" {
+		t.Error("published time is empty")
+	}
+	if len(result.Result.Nodes) == 0 || result.Result.Nodes[0].Evidence == nil {
+		t.Errorf("exported nodes = %+v, want nodes with evidence", result.Result.Nodes)
+	}
+	for _, edge := range result.Result.Edges {
+		if edge.Relation == "typescript:imports_from" && edge.Evidence != nil {
+			return
+		}
+	}
+	t.Errorf("exported edges = %+v, want resolved import edge with evidence", result.Result.Edges)
+}
+
+func TestExportCommandRejectsWorkspaceWithoutPublishedGraph(t *testing.T) {
+	workspace := testkit.NewWorkspace(t, map[string]string{
+		"package.json": `{"name":"fixture"}`,
+	})
+	database := filepath.Join(t.TempDir(), "state", "graph.db")
+	if err := os.MkdirAll(filepath.Dir(database), 0o755); err != nil {
+		t.Fatalf("create database directory: %v", err)
+	}
+
+	command := exec.Command("go", "run", ".", "export", "--database", database, workspace.Root)
+	output, err := command.CombinedOutput()
+	if err == nil {
+		t.Fatalf("run export command succeeded: %s", output)
+	}
+	if got := string(output); !strings.Contains(got, "no published graph is available for workspace") {
+		t.Errorf("export error = %q, want index unavailable message", got)
+	}
+}
+
+func TestQueryCommandReturnsRankedSeedsAndBoundedEvidence(t *testing.T) {
+	workspace := testkit.NewWorkspace(t, map[string]string{
+		"package.json":  `{"name":"fixture"}`,
+		"src/helper.ts": "export function helper() { return 1; }",
+		"src/main.ts":   "import { helper } from './helper'; export function main() { return helper(); }",
+	})
+	database := filepath.Join(t.TempDir(), "state", "graph.db")
+	if output, err := exec.Command("go", "run", ".", "index", "--database", database, workspace.Root).CombinedOutput(); err != nil {
+		t.Fatalf("run index command: %v\n%s", err, output)
+	}
+
+	command := exec.Command("go", "run", ".", "query", "--database", database, "--format", "json", "--max-depth", "1", workspace.Root, "main")
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run query command: %v\n%s", err, output)
+	}
+
+	var result struct {
+		GraphVersion int    `json:"graphVersion"`
+		PublishedAt  string `json:"publishedAt"`
+		Result       struct {
+			Seeds []struct {
+				Term  string `json:"term"`
+				Nodes []struct {
+					QualifiedName string `json:"qualifiedName"`
+				} `json:"nodes"`
+			} `json:"seeds"`
+			Nodes []struct {
+				QualifiedName string `json:"qualifiedName"`
+			} `json:"nodes"`
+			Edges []struct {
+				Relation string `json:"relation"`
+			} `json:"edges"`
+			MaxDepth int `json:"maxDepth"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(output, &result); err != nil {
+		t.Fatalf("decode query result: %v\n%s", err, output)
+	}
+	if result.GraphVersion != 1 || result.PublishedAt == "" {
+		t.Errorf("query envelope = %+v, want published graph metadata", result)
+	}
+	if len(result.Result.Seeds) != 1 || result.Result.Seeds[0].Term != "main" || len(result.Result.Seeds[0].Nodes) == 0 || result.Result.Seeds[0].Nodes[0].QualifiedName != "src/main.ts::main" {
+		t.Errorf("query seeds = %+v, want ranked main seed", result.Result.Seeds)
+	}
+	if result.Result.MaxDepth != 1 {
+		t.Errorf("maximum depth = %d, want 1", result.Result.MaxDepth)
+	}
+	hasCallEdge := false
+	for _, edge := range result.Result.Edges {
+		if edge.Relation == "typescript:calls" {
+			hasCallEdge = true
+			break
+		}
+	}
+	if len(result.Result.Nodes) == 0 || !hasCallEdge {
+		t.Errorf("query facts = nodes %+v, edges %+v, want bounded call evidence", result.Result.Nodes, result.Result.Edges)
+	}
+}
+
+func TestQueryCommandReportsLimitsAndFilteredEvidence(t *testing.T) {
+	workspace := testkit.NewWorkspace(t, map[string]string{
+		"package.json":  `{"name":"fixture"}`,
+		"src/helper.ts": "export function helper() { return 1; }",
+		"src/main.ts":   "import { helper } from './helper'; export function main() { return helper(); }",
+	})
+	database := filepath.Join(t.TempDir(), "state", "graph.db")
+	if output, err := exec.Command("go", "run", ".", "index", "--database", database, workspace.Root).CombinedOutput(); err != nil {
+		t.Fatalf("run index command: %v\n%s", err, output)
+	}
+
+	command := exec.Command("go", "run", ".", "query", "--database", database, "--format", "json", "--max-depth", "0", "--relation", "typescript:calls", workspace.Root, "src/main.ts::main")
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run query command: %v\n%s", err, output)
+	}
+
+	var result struct {
+		Result struct {
+			Nodes []struct {
+				QualifiedName string `json:"qualifiedName"`
+				Evidence      struct {
+					Confidence string `json:"confidence"`
+					Span       struct {
+						Path string `json:"path"`
+					} `json:"span"`
+				} `json:"evidence"`
+			} `json:"nodes"`
+			Edges []struct {
+				Relation string `json:"relation"`
+			} `json:"edges"`
+			TruncationReasons []string `json:"truncationReasons"`
+			MaxDepth          int      `json:"maxDepth"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(output, &result); err != nil {
+		t.Fatalf("decode query result: %v\n%s", err, output)
+	}
+	if result.Result.MaxDepth != 0 {
+		t.Errorf("maximum depth = %d, want 0", result.Result.MaxDepth)
+	}
+	if len(result.Result.Nodes) != 1 || result.Result.Nodes[0].QualifiedName != "src/main.ts::main" || result.Result.Nodes[0].Evidence.Confidence == "" || result.Result.Nodes[0].Evidence.Span.Path != "src/main.ts" {
+		t.Errorf("query nodes = %+v, want evidenced main seed only", result.Result.Nodes)
+	}
+	if len(result.Result.Edges) != 0 {
+		t.Errorf("query edges = %+v, want no edges at depth zero", result.Result.Edges)
+	}
+	if len(result.Result.TruncationReasons) != 1 || result.Result.TruncationReasons[0] != "depth_limit" {
+		t.Errorf("truncation reasons = %v, want depth limit", result.Result.TruncationReasons)
+	}
+}
+
+func TestExplainCommandReportsNodeEvidenceAndGroupedDirectEdges(t *testing.T) {
+	workspace := testkit.NewWorkspace(t, map[string]string{
+		"package.json":  `{"name":"fixture"}`,
+		"src/helper.ts": "export function helper() { return 1; }",
+		"src/main.ts":   "import { helper } from './helper'; export function main() { return helper(); }",
+	})
+	database := filepath.Join(t.TempDir(), "state", "graph.db")
+
+	indexCommand := exec.Command("go", "run", ".", "index", "--database", database, workspace.Root)
+	if output, err := indexCommand.CombinedOutput(); err != nil {
+		t.Fatalf("run index command: %v\n%s", err, output)
+	}
+
+	textCommand := exec.Command("go", "run", ".", "explain", "--database", database, workspace.Root, "src/helper.ts::helper")
+	textOutput, err := textCommand.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run explain command: %v\n%s", err, textOutput)
+	}
+	for _, want := range []string{
+		"Node:",
+		"Source: src/helper.ts:",
+		"Extractor: typescript",
+		"Direct edges:",
+		"typescript:imports_from (1):",
+	} {
+		if !strings.Contains(string(textOutput), want) {
+			t.Errorf("explain text = %q, want %q", textOutput, want)
+		}
+	}
+
+	jsonCommand := exec.Command("go", "run", ".", "explain", "--database", database, "--format", "json", workspace.Root, "src/helper.ts::helper")
+	jsonOutput, err := jsonCommand.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run explain JSON command: %v\n%s", err, jsonOutput)
+	}
+	var result struct {
+		Result struct {
+			Explanation struct {
+				Node struct {
+					Evidence struct {
+						Extractor  string `json:"extractor"`
+						Confidence string `json:"confidence"`
+					} `json:"evidence"`
+				} `json:"node"`
+				SupportingFacts struct {
+					Edges []struct {
+						Relation string `json:"relation"`
+						Evidence any    `json:"evidence"`
+					} `json:"edges"`
+				} `json:"supportingFacts"`
+			} `json:"explanation"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(jsonOutput, &result); err != nil {
+		t.Fatalf("decode explain JSON result: %v\n%s", err, jsonOutput)
+	}
+	if !strings.HasPrefix(result.Result.Explanation.Node.Evidence.Extractor, "typescript") || result.Result.Explanation.Node.Evidence.Confidence == "" {
+		t.Errorf("node evidence = %+v, want TypeScript evidence with confidence", result.Result.Explanation.Node.Evidence)
+	}
+	for _, edge := range result.Result.Explanation.SupportingFacts.Edges {
+		if edge.Relation == "typescript:imports_from" && edge.Evidence != nil {
+			return
+		}
+	}
+	t.Errorf("supporting edges = %+v, want an evidenced import edge", result.Result.Explanation.SupportingFacts.Edges)
+}
+
+func TestExplainCommandReportsAmbiguousCandidatesAndRemainderCount(t *testing.T) {
+	workspace := testkit.NewWorkspace(t, map[string]string{
+		"package.json": `{"name":"fixture"}`,
+		"src/a.ts":     "export function helper() { return 1; }",
+		"src/b.ts":     "export function helper() { return 2; }",
+		"src/c.ts":     "export function helper() { return 3; }",
+		"src/d.ts":     "export function helper() { return 4; }",
+	})
+	database := filepath.Join(t.TempDir(), "state", "graph.db")
+	if output, err := exec.Command("go", "run", ".", "index", "--database", database, workspace.Root).CombinedOutput(); err != nil {
+		t.Fatalf("run index command: %v\n%s", err, output)
+	}
+
+	command := exec.Command("go", "run", ".", "explain", "--database", database, "--format", "json", workspace.Root, "helper")
+	output, err := command.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run ambiguous explain command: %v\n%s", err, output)
+	}
+	var result struct {
+		Result struct {
+			Candidates []struct {
+				QualifiedName string `json:"qualifiedName"`
+			} `json:"candidates"`
+			RemainderCount int `json:"remainderCount"`
+			Explanation    any `json:"explanation"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(output, &result); err != nil {
+		t.Fatalf("decode ambiguous explain JSON result: %v\n%s", err, output)
+	}
+	if len(result.Result.Candidates) != 3 {
+		t.Errorf("candidates = %+v, want three displayed candidates", result.Result.Candidates)
+	}
+	var candidates []string
+	for _, candidate := range result.Result.Candidates {
+		candidates = append(candidates, candidate.QualifiedName)
+	}
+	if want := []string{"src/a.ts::helper", "src/b.ts::helper", "src/c.ts::helper"}; !reflect.DeepEqual(candidates, want) {
+		t.Errorf("candidate qualified names = %v, want %v", candidates, want)
+	}
+	if result.Result.RemainderCount != 1 {
+		t.Errorf("remainder count = %d, want 1", result.Result.RemainderCount)
+	}
+	if result.Result.Explanation != nil {
+		t.Errorf("explanation = %+v, want none for ambiguous candidates", result.Result.Explanation)
+	}
+}
+
+func TestPathCommandReportsDirectedPathAndDeterministicNoResult(t *testing.T) {
+	workspace := testkit.NewWorkspace(t, map[string]string{
+		"package.json":  `{"name":"fixture"}`,
+		"src/helper.ts": "export function helper() { return 1; }",
+		"src/main.ts":   "import { helper } from './helper'; export function main() { return helper(); }",
+	})
+	database := filepath.Join(t.TempDir(), "state", "graph.db")
+	if output, err := exec.Command("go", "run", ".", "index", "--database", database, workspace.Root).CombinedOutput(); err != nil {
+		t.Fatalf("run index command: %v\n%s", err, output)
+	}
+
+	pathCommand := exec.Command("go", "run", ".", "path", "--database", database, workspace.Root, "src/main.ts::main", "src/helper.ts::helper")
+	pathOutput, err := pathCommand.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run path command: %v\n%s", err, pathOutput)
+	}
+	if got := string(pathOutput); !strings.Contains(got, "src/main.ts::main") || !strings.Contains(got, "src/helper.ts::helper") || !strings.Contains(got, "typescript:calls") {
+		t.Errorf("path output = %q, want directed call path", got)
+	}
+
+	noResultCommand := exec.Command("go", "run", ".", "path", "--database", database, workspace.Root, "src/helper.ts::helper", "src/main.ts::main")
+	noResultOutput, err := noResultCommand.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run no-result path command: %v\n%s", err, noResultOutput)
+	}
+	if got := string(noResultOutput); !strings.Contains(got, "No directed path found.") {
+		t.Errorf("no-result path output = %q, want deterministic directed no-result", got)
+	}
+
+	fallbackCommand := exec.Command("go", "run", ".", "path", "--database", database, "--undirected", workspace.Root, "src/helper.ts::helper", "src/main.ts::main")
+	fallbackOutput, err := fallbackCommand.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run undirected fallback path command: %v\n%s", err, fallbackOutput)
+	}
+	if got := string(fallbackOutput); !strings.Contains(got, "Used undirected fallback.") {
+		t.Errorf("fallback path output = %q, want undirected fallback report", got)
+	}
+
+	missingFallbackCommand := exec.Command("go", "run", ".", "path", "--database", database, "--undirected", "--relation", "references", "--format", "json", workspace.Root, "src/main.ts::main", "src/helper.ts::helper")
+	missingFallbackOutput, err := missingFallbackCommand.CombinedOutput()
+	if err != nil {
+		t.Fatalf("run missing undirected path command: %v\n%s", err, missingFallbackOutput)
+	}
+	var missingFallbackResult struct {
+		Result struct {
+			UndirectedFallbackAttempted bool `json:"undirectedFallbackAttempted"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal(missingFallbackOutput, &missingFallbackResult); err != nil {
+		t.Fatalf("decode missing fallback path result: %v\n%s", err, missingFallbackOutput)
+	}
+	if !missingFallbackResult.Result.UndirectedFallbackAttempted {
+		t.Errorf("missing fallback path result = %s, want fallback attempt", missingFallbackOutput)
+	}
+}
+
+func TestIndexerLifecycleCommandsControlBackgroundService(t *testing.T) {
+	workspace, err := os.MkdirTemp("", "ag-")
+	if err != nil {
+		t.Fatalf("create short workspace path: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := os.RemoveAll(workspace); err != nil {
+			t.Errorf("remove workspace: %v", err)
+		}
+	})
+	binary := filepath.Join(t.TempDir(), "agent-graph")
+	build := exec.Command("go", "build", "-o", binary, ".")
+	if output, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build command binary: %v\n%s", err, output)
+	}
+	request := func(arguments ...string) ([]byte, error) {
+		return exec.Command(binary, arguments...).CombinedOutput()
+	}
+
+	output, err := request("indexer", "--format", "json", "start", workspace)
+	if err != nil {
+		t.Fatalf("start workspace indexer: %v\n%s", err, output)
+	}
+	var started struct {
+		Workspace   string   `json:"workspace"`
+		Running     bool     `json:"running"`
+		QueuedPaths []string `json:"queuedPaths"`
+	}
+	if err := json.Unmarshal(output, &started); err != nil {
+		t.Fatalf("decode started indexer status: %v\n%s", err, output)
+	}
+	if started.Workspace != workspace || !started.Running || started.QueuedPaths == nil {
+		t.Errorf("started status = %+v, want running workspace with queued paths", started)
+	}
+
+	output, err = request("indexer", "--format", "json", "status", workspace)
+	if err != nil {
+		t.Fatalf("get workspace indexer status: %v\n%s", err, output)
+	}
+	var status map[string]any
+	if err := json.Unmarshal(output, &status); err != nil {
+		t.Fatalf("decode indexer status: %v\n%s", err, output)
+	}
+	for _, field := range []string{"workspace", "activity", "progress", "queuedPaths", "version", "error", "idleDeadline"} {
+		if _, found := status[field]; !found {
+			t.Errorf("status fields = %v, missing %q", status, field)
+		}
+	}
+
+	output, err = request("indexer", "stop", workspace)
+	if err != nil {
+		t.Fatalf("stop workspace indexer: %v\n%s", err, output)
+	}
+	if _, err := request("indexer", "status", workspace); err == nil {
+		t.Error("status after stop succeeded, want connection failure")
+	}
+}
