@@ -69,6 +69,8 @@ type Options struct {
 var _ storage.Publisher = (*Store)(nil)
 var _ storage.ProgressPublisher = (*Store)(nil)
 var _ storage.StagedPublisher = (*Store)(nil)
+var _ storage.ContributionSessionStore = (*Store)(nil)
+var _ storage.ContributionSession = (*contributionSession)(nil)
 var _ storage.AffectedSourceFinder = (*Store)(nil)
 var _ storage.SourceContributionReader = (*Store)(nil)
 var _ storage.ResolverProjectionReader = (*Store)(nil)
@@ -153,15 +155,17 @@ func sqliteVariableLimit(ctx context.Context, database *sql.DB) (int, error) {
 }
 
 func openDatabase(ctx context.Context, path string) (*sql.DB, error) {
-	database, err := sql.Open("sqlite3", path)
+	// _journal_mode=WAL lets one writer and multiple readers use the database at the
+	// same time, so a contribution session can hold an open write transaction while
+	// plain Store reads keep seeing the prior committed snapshot. _txlock=immediate
+	// serializes writers before they read a graph version.
+	// _foreign_keys and _busy_timeout are per-connection settings; setting them in the
+	// DSN applies them to every pooled connection, not only the first one opened.
+	database, err := sql.Open("sqlite3", path+"?_foreign_keys=1&_journal_mode=WAL&_busy_timeout=5000&_txlock=immediate")
 	if err != nil {
 		return nil, fmt.Errorf("open SQLite database: %w", err)
 	}
-	database.SetMaxOpenConns(1)
-	if _, err := database.ExecContext(ctx, "PRAGMA foreign_keys = ON"); err != nil {
-		_ = database.Close()
-		return nil, fmt.Errorf("enable SQLite foreign keys: %w", err)
-	}
+	database.SetMaxOpenConns(4)
 	if _, err := database.ExecContext(ctx, fmt.Sprintf("PRAGMA cache_size = -%d", pageCacheKiB)); err != nil {
 		_ = database.Close()
 		return nil, fmt.Errorf("set SQLite page cache size: %w", err)
@@ -285,6 +289,337 @@ func (store *Store) publish(ctx context.Context, request storage.PublishRequest,
 	store.cachePublishedContributions(request.Workspace, version, request.Update)
 	_ = reclaimFreePages(ctx, store.database)
 	return storage.Snapshot{Workspace: request.Workspace, Version: version, PublishedAt: publishedAt}, nil
+}
+
+// BeginContributionSession opens one SQLite transaction that accepts contribution writes
+// before final workspace facts are resolved and one graph version is committed.
+func (store *Store) BeginContributionSession(ctx context.Context, workspace string) (storage.ContributionSession, error) {
+	if workspace == "" {
+		return nil, fmt.Errorf("begin contribution session: %w: workspace is required", storage.ErrInvalidRequest)
+	}
+	beganAt := time.Now()
+	transaction, err := store.database.BeginTx(ctx, nil)
+	if err != nil {
+		return nil, fmt.Errorf("start contribution session: %w", err)
+	}
+	session := &contributionSession{
+		store:       store,
+		transaction: transaction,
+		workspace:   workspace,
+		beganAt:     beganAt,
+		batch:       newPublicationBatch(store.variableLimit, nil),
+		sourcePaths: make(map[string]struct{}),
+	}
+	if err := transaction.QueryRowContext(ctx, "SELECT COALESCE(MAX(version), 0) + 1 FROM graph_versions WHERE workspace = ?", workspace).Scan(&session.pendingVersion); err != nil {
+		_ = transaction.Rollback()
+		return nil, fmt.Errorf("allocate contribution session graph version: %w", err)
+	}
+	return session, nil
+}
+
+// contributionSession stages contribution writes in one transaction and resolves reads
+// against its own pending, uncommitted graph version. It exposes no partial facts: a
+// write failure or an explicit rollback rolls back the whole transaction, and the new
+// version becomes visible to other readers only when Commit succeeds.
+type contributionSession struct {
+	store          *Store
+	transaction    *sql.Tx
+	workspace      string
+	beganAt        time.Time
+	pendingVersion storage.GraphVersion
+	batch          publicationBatch
+	contributions  []extractor.Contribution
+	sourcePaths    map[string]struct{}
+	closed         bool
+}
+
+// fail rolls back the session's transaction and marks the session closed, so it exposes no partial facts.
+func (session *contributionSession) fail(err error) error {
+	if !session.closed {
+		session.closed = true
+		_ = session.transaction.Rollback()
+	}
+	return err
+}
+
+func (session *contributionSession) WriteContribution(ctx context.Context, contribution extractor.Contribution) error {
+	if session.closed {
+		return fmt.Errorf("write contribution: %w: session is closed", storage.ErrInvalidRequest)
+	}
+	sourcePath := contribution.SourcePath()
+	if _, exists := session.sourcePaths[sourcePath]; exists {
+		return session.fail(fmt.Errorf("write contribution: %w: duplicate source path %q", storage.ErrInvalidRequest, sourcePath))
+	}
+	update, err := extractor.NewGraphUpdate([]extractor.Contribution{contribution})
+	if err != nil {
+		return session.fail(fmt.Errorf("write contribution: %w", err))
+	}
+	encoded, err := encodeContributions(update)
+	if err != nil {
+		return session.fail(err)
+	}
+	prepared, err := prepareContribution(session.workspace, session.pendingVersion, 0, encoded[0])
+	if err != nil {
+		return session.fail(err)
+	}
+	if err := session.batch.add(ctx, session.transaction, session.workspace, session.pendingVersion, prepared); err != nil {
+		return session.fail(fmt.Errorf("write contribution: %w", err))
+	}
+	// Flush now so a write failure surfaces from this call and staged resolver reads
+	// in the same session can see the contribution before commit.
+	if err := session.batch.flush(ctx, session.transaction); err != nil {
+		return session.fail(fmt.Errorf("write contribution: %w", err))
+	}
+	session.sourcePaths[sourcePath] = struct{}{}
+	session.contributions = append(session.contributions, contribution)
+	return nil
+}
+
+func (session *contributionSession) ReplaceContributionDependencies(ctx context.Context, contributions []extractor.Contribution) error {
+	if session.closed {
+		return fmt.Errorf("replace contribution dependencies: %w: session is closed", storage.ErrInvalidRequest)
+	}
+	updated := make(map[string]extractor.Contribution, len(contributions))
+	for _, contribution := range contributions {
+		sourcePath := contribution.SourcePath()
+		if _, exists := session.sourcePaths[sourcePath]; !exists {
+			return session.fail(fmt.Errorf("replace contribution dependencies: %w: source path %q is not staged", storage.ErrInvalidRequest, sourcePath))
+		}
+		if _, exists := updated[sourcePath]; exists {
+			return session.fail(fmt.Errorf("replace contribution dependencies: %w: duplicate source path %q", storage.ErrInvalidRequest, sourcePath))
+		}
+		updated[sourcePath] = contribution
+	}
+	for sourcePath := range updated {
+		if _, err := session.transaction.ExecContext(ctx, "DELETE FROM contribution_dependencies WHERE workspace = ? AND source_path = ? AND valid_from_version = ?", session.workspace, sourcePath, session.pendingVersion); err != nil {
+			return session.fail(fmt.Errorf("replace contribution dependencies: %w", err))
+		}
+	}
+	rows := make([][]any, 0)
+	for _, contribution := range contributions {
+		for _, dependency := range contribution.Dependencies() {
+			rows = append(rows, []any{session.workspace, contribution.SourcePath(), session.pendingVersion, dependency.TargetPath})
+		}
+	}
+	if err := insertRows(ctx, session.transaction, session.store.variableLimit, maximumBatchRows,
+		"INSERT OR IGNORE INTO contribution_dependencies (workspace, source_path, valid_from_version, target_path) VALUES ", rows); err != nil {
+		return session.fail(fmt.Errorf("replace contribution dependencies: %w", err))
+	}
+	for contributionIndex, contribution := range session.contributions {
+		if replacement, found := updated[contribution.SourcePath()]; found {
+			session.contributions[contributionIndex] = replacement
+		}
+	}
+	return nil
+}
+
+func (session *contributionSession) Commit(ctx context.Context, request storage.CommitRequest) (storage.Snapshot, error) {
+	if session.closed {
+		return storage.Snapshot{}, fmt.Errorf("commit contribution session: %w: session is closed", storage.ErrInvalidRequest)
+	}
+	if err := session.batch.flush(ctx, session.transaction); err != nil {
+		return storage.Snapshot{}, session.fail(err)
+	}
+	publishedAt := time.Now().UTC()
+	if err := insertRows(ctx, session.transaction, session.store.variableLimit, maximumBatchRows,
+		"INSERT INTO graph_versions (workspace, version, published_at) VALUES ",
+		[][]any{{session.workspace, session.pendingVersion, publishedAt.Format(time.RFC3339Nano)}}); err != nil {
+		return storage.Snapshot{}, session.fail(fmt.Errorf("record graph publication: %w", err))
+	}
+	if err := retainWorkspaceFacts(ctx, session.transaction, session.workspace, session.pendingVersion, request.ReplacedWorkspaceFactOwners); err != nil {
+		return storage.Snapshot{}, session.fail(err)
+	}
+	if err := storeWorkspaceFacts(ctx, session.transaction, session.store.variableLimit, session.workspace, session.pendingVersion, request.WorkspaceFacts, request.SQLiteWriteMeasurement); err != nil {
+		return storage.Snapshot{}, session.fail(err)
+	}
+	if session.pendingVersion > retainedGraphVersions {
+		if _, err := pruneVersions(ctx, session.transaction, session.workspace, session.pendingVersion-retainedGraphVersions+1); err != nil {
+			return storage.Snapshot{}, session.fail(err)
+		}
+	}
+	if err := ensureDatabaseBudget(ctx, session.transaction, session.store.maxDatabaseBytes); err != nil {
+		return storage.Snapshot{}, session.fail(err)
+	}
+
+	commitStarted := time.Now()
+	if err := session.transaction.Commit(); err != nil {
+		session.closed = true
+		return storage.Snapshot{}, fmt.Errorf("commit contribution session: %w", err)
+	}
+	session.closed = true
+	reportPublishMeasurement(request.Measurement, storage.CommitMeasurement, time.Since(commitStarted))
+	reportPublishMeasurement(request.Measurement, storage.StagedTransactionMeasurement, time.Since(session.beganAt))
+
+	var update extractor.GraphUpdate
+	if len(session.contributions) > 0 {
+		update, _ = extractor.NewGraphUpdate(session.contributions)
+	}
+	session.store.cachePublishedContributions(session.workspace, session.pendingVersion, update)
+	_ = reclaimFreePages(ctx, session.store.database)
+	return storage.Snapshot{Workspace: session.workspace, Version: session.pendingVersion, PublishedAt: publishedAt}, nil
+}
+
+func (session *contributionSession) Rollback(ctx context.Context) error {
+	if session.closed {
+		return nil
+	}
+	session.closed = true
+	if err := session.transaction.Rollback(); err != nil {
+		return fmt.Errorf("rollback contribution session: %w", err)
+	}
+	return nil
+}
+
+func (session *contributionSession) ResolverProjectionPage(ctx context.Context, snapshot storage.Snapshot, request storage.ResolverProjectionPageRequest) ([]storage.ResolverProjection, error) {
+	if session.closed {
+		return nil, fmt.Errorf("read contribution session resolver projection page: %w: session is closed", storage.ErrInvalidRequest)
+	}
+	if snapshot.Workspace != session.workspace || request.ProjectID == "" || request.Language == "" || request.Limit <= 0 {
+		return nil, fmt.Errorf("read contribution session resolver projection page: %w: snapshot, project, language, and positive limit are required", storage.ErrInvalidRequest)
+	}
+	rows, err := session.transaction.QueryContext(ctx, `
+		SELECT source_path, project_id, extractor_name, extractor_version
+		FROM file_contributions
+		WHERE workspace = ?
+			AND valid_from_version <= ?
+			AND (valid_to_version IS NULL OR valid_to_version >= ?)
+			AND project_id = ?
+			AND extractor_name = ?
+			AND source_path > ?
+		ORDER BY source_path
+		LIMIT ?`,
+		session.workspace, session.pendingVersion, session.pendingVersion,
+		request.ProjectID, request.Language, request.AfterSourcePath, request.Limit)
+	if err != nil {
+		return nil, fmt.Errorf("read contribution session resolver projection page: %w", err)
+	}
+	defer rows.Close()
+	projections := make([]storage.ResolverProjection, 0, request.Limit)
+	for rows.Next() {
+		var projection storage.ResolverProjection
+		if err := rows.Scan(&projection.SourcePath, &projection.ProjectID, &projection.Metadata.Name, &projection.Metadata.Version); err != nil {
+			return nil, fmt.Errorf("read contribution session resolver projection page: %w", err)
+		}
+		projections = append(projections, projection)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate contribution session resolver projection page: %w", err)
+	}
+	if err := rows.Close(); err != nil {
+		return nil, fmt.Errorf("close contribution session resolver projection page: %w", err)
+	}
+	pendingSnapshot := storage.Snapshot{Workspace: session.workspace, Version: session.pendingVersion}
+	for projectionIndex := range projections {
+		projection := &projections[projectionIndex]
+		data, err := storeResolutionDataForSource(ctx, session.transaction, pendingSnapshot, projection.SourcePath)
+		if err != nil {
+			return nil, err
+		}
+		projection.Metadata.Extensions = data.Metadata.Extensions
+		if err := projection.Metadata.Validate(); err != nil {
+			return nil, fmt.Errorf("read contribution session resolver projection %q: metadata: %w", projection.SourcePath, err)
+		}
+		projection.UnresolvedReferences = data.UnresolvedReferences
+		projection.SymbolReferences = data.SymbolReferences
+		projection.ExportedSurfaces = data.ExportedSurfaces
+		projection.Dependencies = data.Dependencies
+		projection.Diagnostics = data.Diagnostics
+	}
+	return projections, nil
+}
+
+func (session *contributionSession) ResolverTarget(ctx context.Context, snapshot storage.Snapshot, request extractor.ResolverTargetRequest) (extractor.ResolverTarget, bool, error) {
+	if session.closed {
+		return extractor.ResolverTarget{}, false, fmt.Errorf("read contribution session resolver target: %w: session is closed", storage.ErrInvalidRequest)
+	}
+	if snapshot.Workspace != session.workspace || request.ProjectID == "" || request.Language == "" || request.SourcePath == "" {
+		return extractor.ResolverTarget{}, false, fmt.Errorf("read contribution session resolver target: %w: snapshot, project, language, and source path are required", storage.ErrInvalidRequest)
+	}
+	target := extractor.ResolverTarget{ProjectID: request.ProjectID, SourcePath: request.SourcePath}
+	err := session.transaction.QueryRowContext(ctx, `
+		SELECT extractor_name, extractor_version
+		FROM file_contributions
+		WHERE workspace = ?
+			AND valid_from_version <= ?
+			AND (valid_to_version IS NULL OR valid_to_version >= ?)
+			AND project_id = ?
+			AND extractor_name = ?
+			AND source_path = ?`,
+		session.workspace, session.pendingVersion, session.pendingVersion,
+		request.ProjectID, request.Language, request.SourcePath,
+	).Scan(&target.Metadata.Name, &target.Metadata.Version)
+	if errors.Is(err, sql.ErrNoRows) {
+		return extractor.ResolverTarget{}, false, nil
+	}
+	if err != nil {
+		return extractor.ResolverTarget{}, false, fmt.Errorf("read contribution session resolver target: %w", err)
+	}
+	pendingSnapshot := storage.Snapshot{Workspace: session.workspace, Version: session.pendingVersion}
+	data, err := storeResolutionDataForSource(ctx, session.transaction, pendingSnapshot, request.SourcePath)
+	if err != nil {
+		return extractor.ResolverTarget{}, false, err
+	}
+	target.Metadata.Extensions = data.Metadata.Extensions
+	if err := target.Metadata.Validate(); err != nil {
+		return extractor.ResolverTarget{}, false, fmt.Errorf("read contribution session resolver target %q: metadata: %w", request.SourcePath, err)
+	}
+	var facts graph.Facts
+	if err := appendNodes(ctx, session.transaction, &facts, `
+		SELECT node_id, kind, label, qualified_name, span_path, start_line, start_column, end_line, end_column, file_hash, extractor, provenance, confidence
+		FROM contribution_nodes
+		WHERE workspace = ? AND source_path = ? AND valid_from_version <= ? AND (valid_to_version IS NULL OR valid_to_version >= ?)
+		ORDER BY node_id`, session.workspace, request.SourcePath, session.pendingVersion, session.pendingVersion); err != nil {
+		return extractor.ResolverTarget{}, false, err
+	}
+	target.Nodes = facts.Nodes
+	target.UnresolvedReferences = data.UnresolvedReferences
+	target.SymbolReferences = data.SymbolReferences
+	target.ExportedSurfaces = data.ExportedSurfaces
+	target.Diagnostics = data.Diagnostics
+	return target, true, nil
+}
+
+func (session *contributionSession) ResolverPackagePage(ctx context.Context, snapshot storage.Snapshot, request extractor.ResolverPackagePageRequest) ([]extractor.ResolverTarget, error) {
+	if session.closed {
+		return nil, fmt.Errorf("read contribution session resolver package page: %w: session is closed", storage.ErrInvalidRequest)
+	}
+	if snapshot.Workspace != session.workspace || request.ProjectID == "" || request.Language == "" || request.PackagePath == "" || request.Limit <= 0 {
+		return nil, fmt.Errorf("read contribution session resolver package page: %w: snapshot, project, language, package path, and positive limit are required", storage.ErrInvalidRequest)
+	}
+	pathFilter := "source_path LIKE ? AND INSTR(source_path, '/') = 0"
+	pathArguments := []any{"%"}
+	if request.PackagePath != "." {
+		prefix := request.PackagePath + "/"
+		pathFilter = "source_path LIKE ? AND INSTR(SUBSTR(source_path, LENGTH(?) + 1), '/') = 0"
+		pathArguments = []any{prefix + "%", prefix}
+	}
+	query := `SELECT source_path FROM file_contributions WHERE workspace = ? AND valid_from_version <= ? AND (valid_to_version IS NULL OR valid_to_version >= ?) AND project_id = ? AND extractor_name = ? AND ` + pathFilter + ` AND source_path > ? ORDER BY source_path LIMIT ?`
+	arguments := []any{session.workspace, session.pendingVersion, session.pendingVersion, request.ProjectID, request.Language}
+	arguments = append(arguments, pathArguments...)
+	arguments = append(arguments, request.AfterSourcePath, request.Limit)
+	rows, err := session.transaction.QueryContext(ctx, query, arguments...)
+	if err != nil {
+		return nil, fmt.Errorf("read contribution session resolver package page: %w", err)
+	}
+	defer rows.Close()
+	targets := make([]extractor.ResolverTarget, 0, request.Limit)
+	for rows.Next() {
+		var sourcePath string
+		if err := rows.Scan(&sourcePath); err != nil {
+			return nil, fmt.Errorf("read contribution session resolver package page: %w", err)
+		}
+		target, found, err := session.ResolverTarget(ctx, snapshot, extractor.ResolverTargetRequest{ProjectID: request.ProjectID, Language: request.Language, SourcePath: sourcePath})
+		if err != nil {
+			return nil, err
+		}
+		if found {
+			targets = append(targets, target)
+		}
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate contribution session resolver package page: %w", err)
+	}
+	return targets, nil
 }
 
 const stagedResolverSourcesTable = "staged_resolver_sources"

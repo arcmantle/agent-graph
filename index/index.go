@@ -37,11 +37,14 @@ type Measurement struct {
 
 const (
 	ExtractionMeasurement              = "extraction"
+	ExtractionWriteOverlapMeasurement  = "extraction_write_overlap"
 	ResolutionMeasurement              = "resolution"
 	AffectedSourceSelectionMeasurement = "affected_source_selection"
 	ContributionRestorationMeasurement = "contribution_restoration"
 	WorkspaceResolutionMeasurement     = "workspace_resolution"
 )
+
+const initialContributionQueueCapacity = 32
 
 type ProgressPhase string
 
@@ -367,6 +370,9 @@ func Index(ctx context.Context, publisher storage.Publisher, request Request) (R
 	if err != nil {
 		return Result{}, fmt.Errorf("index workspace: create extractor registry: %w", err)
 	}
+	if sessionStore, supported := publisher.(storage.ContributionSessionStore); supported {
+		return indexWithContributionSession(ctx, sessionStore, request, root, discovery.Sources, registered)
+	}
 
 	reportProgress(request.Progress, Progress{Phase: ExtractPhase, TotalSources: len(discovery.Sources)})
 	extractionStarted := time.Now()
@@ -392,7 +398,6 @@ func Index(ctx context.Context, publisher storage.Publisher, request Request) (R
 		return Result{}, fmt.Errorf("index workspace: record resolved dependencies: %w", err)
 	}
 	reportMeasurement(request.Measurement, ResolutionMeasurement, time.Since(resolutionStarted))
-
 	update, err := extractor.NewGraphUpdate(contributions)
 	if err != nil {
 		return Result{}, fmt.Errorf("index workspace: create graph update: %w", err)
@@ -427,6 +432,160 @@ func Index(ctx context.Context, publisher storage.Publisher, request Request) (R
 		return Result{}, fmt.Errorf("index workspace: publish graph update: %w", err)
 	}
 	return Result{Snapshot: snapshot, Diagnostics: diagnostics}, nil
+}
+
+func indexWithContributionSession(ctx context.Context, store storage.ContributionSessionStore, request Request, root string, sources []workspace.Source, registered registry.Registry) (Result, error) {
+	preparationStarted := time.Now()
+	session, err := store.BeginContributionSession(ctx, root)
+	if err != nil {
+		return Result{}, fmt.Errorf("index workspace: begin contribution session: %w", err)
+	}
+	defer session.Rollback(context.Background())
+	preparationDuration := time.Since(preparationStarted)
+
+	reportProgress(request.Progress, Progress{Phase: ExtractPhase, TotalSources: len(sources)})
+	extractionStarted := time.Now()
+	extracted, writeDuration, overlapDuration, err := extractAndWriteContributions(ctx, session, root, sources, registered, func(completed int) {
+		reportProgress(request.Progress, Progress{Phase: ExtractPhase, CompletedSources: completed, TotalSources: len(sources)})
+	})
+	if err != nil {
+		return Result{}, fmt.Errorf("index workspace: %w", err)
+	}
+	reportMeasurement(request.Measurement, ExtractionMeasurement, time.Since(extractionStarted))
+	reportMeasurement(request.Measurement, ExtractionWriteOverlapMeasurement, overlapDuration)
+	if len(extracted) == 0 {
+		return Result{}, fmt.Errorf("index workspace: no supported source files discovered")
+	}
+
+	reportProgress(request.Progress, Progress{Phase: ResolvePhase, CompletedSources: len(extracted), TotalSources: len(sources)})
+	resolutionStarted := time.Now()
+	workspaceFacts, diagnostics, err := resolveWorkspaceFacts(root, extracted)
+	if err != nil {
+		return Result{}, fmt.Errorf("index workspace: resolve facts: %w", err)
+	}
+	contributions, err := withResolvedDependencies(contributionsFromSources(extracted), workspaceFacts)
+	if err != nil {
+		return Result{}, fmt.Errorf("index workspace: record resolved dependencies: %w", err)
+	}
+	dependenciesStarted := time.Now()
+	if err := session.ReplaceContributionDependencies(ctx, contributions); err != nil {
+		return Result{}, fmt.Errorf("index workspace: replace contribution dependencies: %w", err)
+	}
+	writeDuration += time.Since(dependenciesStarted)
+	reportMeasurement(request.Measurement, ResolutionMeasurement, time.Since(resolutionStarted))
+	reportMeasurement(request.Measurement, storage.PublicationPreparationMeasurement, preparationDuration)
+	reportMeasurement(request.Measurement, storage.SQLiteWriteMeasurement, writeDuration)
+
+	reportProgress(request.Progress, Progress{Phase: PublishPhase, CompletedSources: len(contributions), TotalSources: len(contributions)})
+	snapshot, err := session.Commit(ctx, storage.CommitRequest{
+		WorkspaceFacts: workspaceFacts,
+		Measurement: func(measurement storage.PublishMeasurement) {
+			reportMeasurement(request.Measurement, measurement.Name, measurement.Duration)
+		},
+		SQLiteWriteMeasurement: request.SQLiteWriteMeasurement,
+	})
+	if err != nil {
+		return Result{}, fmt.Errorf("index workspace: commit contribution session: %w", err)
+	}
+	return Result{Snapshot: snapshot, Diagnostics: diagnostics}, nil
+}
+
+type contributionExtractionResult struct {
+	index  int
+	source extractedSource
+	err    error
+}
+
+func extractAndWriteContributions(ctx context.Context, session storage.ContributionSession, root string, sources []workspace.Source, registered registry.Registry, progress func(int)) ([]extractedSource, time.Duration, time.Duration, error) {
+	if len(sources) == 0 {
+		return nil, 0, 0, nil
+	}
+	started := time.Now()
+	pipelineContext, cancel := context.WithCancel(ctx)
+	defer cancel()
+	results := make(chan contributionExtractionResult, min(len(sources), initialContributionQueueCapacity))
+	jobs := make(chan int)
+	workerCount := min(len(sources), max(1, runtime.GOMAXPROCS(0)))
+	var workers sync.WaitGroup
+	workers.Add(workerCount)
+	for range workerCount {
+		go func() {
+			defer workers.Done()
+			typescriptWorker, err := typescript.NewWorker()
+			if err != nil {
+				select {
+				case results <- contributionExtractionResult{err: fmt.Errorf("create TypeScript extraction worker: %w", err)}:
+				case <-pipelineContext.Done():
+				}
+				return
+			}
+			defer typescriptWorker.Close()
+			for sourceIndex := range jobs {
+				extracted, err := extractDiscoveredSource(root, sources[sourceIndex], registered, typescriptWorker)
+				select {
+				case results <- contributionExtractionResult{index: sourceIndex, source: extracted, err: err}:
+				case <-pipelineContext.Done():
+					return
+				}
+			}
+		}()
+	}
+	go func() {
+		defer close(jobs)
+		for sourceIndex := range sources {
+			select {
+			case jobs <- sourceIndex:
+			case <-pipelineContext.Done():
+				return
+			}
+		}
+	}()
+	var producersFinishedAt time.Time
+	go func() {
+		workers.Wait()
+		producersFinishedAt = time.Now()
+		close(results)
+	}()
+
+	extracted := make([]extractedSource, len(sources))
+	completed := 0
+	var writeDuration time.Duration
+	var firstError error
+	for result := range results {
+		if firstError != nil {
+			continue
+		}
+		if result.err != nil {
+			firstError = result.err
+			cancel()
+			continue
+		}
+		writeStarted := time.Now()
+		if err := session.WriteContribution(ctx, result.source.contribution); err != nil {
+			firstError = fmt.Errorf("write contribution: %w", err)
+			cancel()
+			continue
+		}
+		writeDuration += time.Since(writeStarted)
+		extracted[result.index] = result.source
+		completed++
+		if progress != nil {
+			progress(completed)
+		}
+	}
+	if firstError != nil {
+		return nil, 0, 0, firstError
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, 0, 0, err
+	}
+	// Overlap is the wall time saved by writing while extraction workers still produce:
+	// extraction-only time plus write time, minus the phase's actual wall-clock span.
+	overlap := producersFinishedAt.Sub(started) + writeDuration - time.Since(started)
+	if overlap < 0 {
+		overlap = 0
+	}
+	return extracted, writeDuration, overlap, nil
 }
 
 func extractDiscoveredSources(root string, sources []workspace.Source, registered registry.Registry) ([]extractedSource, error) {

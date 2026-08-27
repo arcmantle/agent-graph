@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -21,6 +22,51 @@ import (
 	"agent-graph/storage/sqlite"
 	"agent-graph/testkit"
 )
+
+type contributionSessionStore struct {
+	*sqlite.Store
+	sessions      int
+	contributions int
+	writeStarted  chan struct{}
+	releaseWrites chan struct{}
+	writeError    error
+	writeOnce     sync.Once
+}
+
+func (store *contributionSessionStore) Publish(context.Context, storage.PublishRequest) (storage.Snapshot, error) {
+	return storage.Snapshot{}, errors.New("initial index used legacy publisher")
+}
+
+func (store *contributionSessionStore) BeginContributionSession(ctx context.Context, workspace string) (storage.ContributionSession, error) {
+	session, err := store.Store.BeginContributionSession(ctx, workspace)
+	if err != nil {
+		return nil, err
+	}
+	store.sessions++
+	return contributionSessionObserver{ContributionSession: session, store: store}, nil
+}
+
+type contributionSessionObserver struct {
+	storage.ContributionSession
+	store *contributionSessionStore
+}
+
+func (observer contributionSessionObserver) WriteContribution(ctx context.Context, contribution extractor.Contribution) error {
+	if observer.store.writeError != nil {
+		return observer.store.writeError
+	}
+	if observer.store.writeStarted != nil {
+		observer.store.writeOnce.Do(func() {
+			close(observer.store.writeStarted)
+			<-observer.store.releaseWrites
+		})
+	}
+	if err := observer.ContributionSession.WriteContribution(ctx, contribution); err != nil {
+		return err
+	}
+	observer.store.contributions++
+	return nil
+}
 
 func TestPublishCreatesInitialWorkspaceGraph(t *testing.T) {
 	workspace := testkit.NewWorkspace(t, map[string]string{
@@ -49,6 +95,180 @@ func TestPublishCreatesInitialWorkspaceGraph(t *testing.T) {
 	}
 	if snapshot.PublishedAt.IsZero() {
 		t.Error("snapshot publication time is zero")
+	}
+}
+
+func TestIndexPublishesInitialWorkspaceThroughContributionSession(t *testing.T) {
+	workspace := testkit.NewWorkspace(t, map[string]string{
+		"package.json":  `{"name":"fixture"}`,
+		"src/helper.ts": "export function helper() { return 1; }",
+		"src/main.ts":   "import { helper } from './helper'; export function main() { return helper(); }",
+	})
+	baseStore, err := sqlite.Open(context.Background(), filepath.Join(t.TempDir(), "graph.db"))
+	if err != nil {
+		t.Fatalf("open graph store: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := baseStore.Close(); err != nil {
+			t.Errorf("close graph store: %v", err)
+		}
+	})
+	store := &contributionSessionStore{Store: baseStore}
+
+	result, err := index.Index(context.Background(), store, index.Request{Root: workspace.Root})
+	if err != nil {
+		t.Fatalf("index workspace: %v", err)
+	}
+	if store.sessions != 1 || store.contributions != 2 {
+		t.Errorf("contribution session activity = %d sessions, %d contributions, want 1 session and 2 contributions", store.sessions, store.contributions)
+	}
+	collector := &factCollector{}
+	if err := store.Export(context.Background(), result.Snapshot, storage.ExportRequest{}, collector); err != nil {
+		t.Fatalf("export indexed graph: %v", err)
+	}
+	if !hasImportTargetFrom(collector, "src/main.ts", "src/helper.ts::helper") {
+		t.Errorf("indexed graph does not contain the resolved TypeScript import: %+v", collector.edges)
+	}
+}
+
+func TestIndexWritesContributionsBeforeExtractionCompletes(t *testing.T) {
+	const sourceCount = 129
+	files := map[string]string{"package.json": `{"name":"fixture"}`}
+	for sourceIndex := range sourceCount {
+		files[fmt.Sprintf("src/source-%03d.ts", sourceIndex)] = fmt.Sprintf("export const value%d = %d;", sourceIndex, sourceIndex)
+	}
+	workspace := testkit.NewWorkspace(t, files)
+	baseStore, err := sqlite.Open(context.Background(), filepath.Join(t.TempDir(), "graph.db"))
+	if err != nil {
+		t.Fatalf("open graph store: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := baseStore.Close(); err != nil {
+			t.Errorf("close graph store: %v", err)
+		}
+	})
+	store := &contributionSessionStore{
+		Store:         baseStore,
+		writeStarted:  make(chan struct{}),
+		releaseWrites: make(chan struct{}),
+	}
+	progress := make(chan int, sourceCount+1)
+	indexed := make(chan error, 1)
+	go func() {
+		_, err := index.Index(context.Background(), store, index.Request{
+			Root: workspace.Root,
+			Progress: func(update index.Progress) {
+				if update.Phase == index.ExtractPhase {
+					progress <- update.CompletedSources
+				}
+			},
+		})
+		indexed <- err
+	}()
+
+	select {
+	case <-store.writeStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("initial index did not start a contribution write")
+	}
+	completedSources := 0
+readProgress:
+	for {
+		select {
+		case completedSources = <-progress:
+		default:
+			break readProgress
+		}
+	}
+	close(store.releaseWrites)
+	if completedSources == sourceCount {
+		t.Error("initial index completed extraction before starting the first contribution write")
+	}
+	if err := <-indexed; err != nil {
+		t.Fatalf("index workspace: %v", err)
+	}
+}
+
+func TestIndexContributionWriteFailureKeepsPriorSnapshotCurrent(t *testing.T) {
+	workspace := testkit.NewWorkspace(t, map[string]string{
+		"package.json": `{"name":"fixture"}`,
+		"src/main.ts":  "export function main() { return 1; }",
+	})
+	baseStore, err := sqlite.Open(context.Background(), filepath.Join(t.TempDir(), "graph.db"))
+	if err != nil {
+		t.Fatalf("open graph store: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := baseStore.Close(); err != nil {
+			t.Errorf("close graph store: %v", err)
+		}
+	})
+	published, err := index.Publish(context.Background(), baseStore, index.Request{Root: workspace.Root})
+	if err != nil {
+		t.Fatalf("publish prior snapshot: %v", err)
+	}
+	workspace.WriteFile(t, "src/main.ts", "export function replacement() { return 2; }")
+	store := &contributionSessionStore{Store: baseStore, writeError: errors.New("injected contribution write failure")}
+
+	_, err = index.Index(context.Background(), store, index.Request{Root: workspace.Root})
+	if err == nil || !strings.Contains(err.Error(), "injected contribution write failure") {
+		t.Errorf("index error = %v, want contribution write failure", err)
+	}
+	current, err := baseStore.OpenSnapshot(context.Background(), storage.OpenSnapshotRequest{Workspace: workspace.Root})
+	if err != nil {
+		t.Fatalf("open current snapshot: %v", err)
+	}
+	if current != published {
+		t.Errorf("current snapshot after contribution write failure = %+v, want %+v", current, published)
+	}
+}
+
+func TestIndexCancellationKeepsPriorSnapshotCurrent(t *testing.T) {
+	workspace := testkit.NewWorkspace(t, map[string]string{
+		"package.json": `{"name":"fixture"}`,
+		"src/main.ts":  "export function main() { return 1; }",
+	})
+	baseStore, err := sqlite.Open(context.Background(), filepath.Join(t.TempDir(), "graph.db"))
+	if err != nil {
+		t.Fatalf("open graph store: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := baseStore.Close(); err != nil {
+			t.Errorf("close graph store: %v", err)
+		}
+	})
+	published, err := index.Publish(context.Background(), baseStore, index.Request{Root: workspace.Root})
+	if err != nil {
+		t.Fatalf("publish prior snapshot: %v", err)
+	}
+	workspace.WriteFile(t, "src/main.ts", "export function replacement() { return 2; }")
+	store := &contributionSessionStore{
+		Store:         baseStore,
+		writeStarted:  make(chan struct{}),
+		releaseWrites: make(chan struct{}),
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	indexed := make(chan error, 1)
+	go func() {
+		_, err := index.Index(ctx, store, index.Request{Root: workspace.Root})
+		indexed <- err
+	}()
+	select {
+	case <-store.writeStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("initial index did not start a contribution write")
+	}
+	cancel()
+	close(store.releaseWrites)
+	if err := <-indexed; !errors.Is(err, context.Canceled) {
+		t.Errorf("index error = %v, want context cancellation", err)
+	}
+	current, err := baseStore.OpenSnapshot(context.Background(), storage.OpenSnapshotRequest{Workspace: workspace.Root})
+	if err != nil {
+		t.Fatalf("open current snapshot: %v", err)
+	}
+	if current != published {
+		t.Errorf("current snapshot after cancellation = %+v, want %+v", current, published)
 	}
 }
 
@@ -120,7 +340,7 @@ func TestIndexReportsStablePhaseMeasurements(t *testing.T) {
 		t.Fatalf("index workspace: %v", err)
 	}
 
-	wantNames := []string{"extraction", "resolution", "publication_preparation", "sqlite_write", "commit"}
+	wantNames := []string{"extraction", "extraction_write_overlap", "resolution", "publication_preparation", "sqlite_write", "commit", "staged_transaction"}
 	if len(measurements) != len(wantNames) {
 		t.Fatalf("measurements = %+v, want %d phases", measurements, len(wantNames))
 	}

@@ -143,10 +143,10 @@ func TestBenchmarkCommandMeasuresCriticalUserPath(t *testing.T) {
 		}
 	}
 	for runIndex, run := range result.Result.Runs {
-		if len(run.PhaseMeasurements) != 5 {
-			t.Fatalf("run %d phase measurements = %+v, want five indexing phases", runIndex, run.PhaseMeasurements)
+		if len(run.PhaseMeasurements) != 7 {
+			t.Fatalf("run %d phase measurements = %+v, want seven indexing phases", runIndex, run.PhaseMeasurements)
 		}
-		for phaseIndex, want := range []string{"extraction", "resolution", "publication_preparation", "sqlite_write", "commit"} {
+		for phaseIndex, want := range []string{"extraction", "extraction_write_overlap", "resolution", "publication_preparation", "sqlite_write", "commit", "staged_transaction"} {
 			measurement := run.PhaseMeasurements[phaseIndex]
 			if measurement.Name != want {
 				t.Errorf("run %d phase measurement %d name = %q, want %q", runIndex, phaseIndex, measurement.Name, want)

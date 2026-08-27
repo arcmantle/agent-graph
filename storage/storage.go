@@ -52,6 +52,7 @@ const (
 	PublicationPreparationMeasurement = "publication_preparation"
 	SQLiteWriteMeasurement            = "sqlite_write"
 	CommitMeasurement                 = "commit"
+	StagedTransactionMeasurement      = "staged_transaction"
 )
 
 type Publisher interface {
@@ -76,6 +77,29 @@ type ResolverStager interface {
 type StagedPublisher interface {
 	// PublishStaged runs stage and publication in one transaction. The callback returns the complete request to publish.
 	PublishStaged(context.Context, PublishRequest, func(context.Context, ResolverStager) (PublishRequest, error)) (Snapshot, error)
+}
+
+type CommitRequest struct {
+	WorkspaceFacts              graph.Facts
+	ReplacedWorkspaceFactOwners []string
+	Measurement                 func(PublishMeasurement)
+	SQLiteWriteMeasurement      func(PublishMeasurement)
+}
+
+// ContributionSession accepts contribution writes and staged resolver reads before one final commit.
+// A session either commits one complete graph version, or rolls back and exposes no partial facts.
+type ContributionSession interface {
+	ResolverProjectionPageReader
+	ResolverTargetReader
+	ResolverPackagePageReader
+	WriteContribution(context.Context, extractor.Contribution) error
+	ReplaceContributionDependencies(context.Context, []extractor.Contribution) error
+	Commit(context.Context, CommitRequest) (Snapshot, error)
+	Rollback(context.Context) error
+}
+
+type ContributionSessionStore interface {
+	BeginContributionSession(context.Context, string) (ContributionSession, error)
 }
 
 type PublishProgress struct {
