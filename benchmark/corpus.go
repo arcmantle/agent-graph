@@ -135,6 +135,141 @@ func distributedCount(total, buckets, bucket int) int {
 	return count
 }
 
+// RealisticCorpusSpec generates a corpus shaped after measured workspace density
+// (imports, exports, and declaration mix per file) instead of CorpusSpec's dense,
+// single-kind, linear import chain. Node and edge counts are data-derived, so
+// Corpus.ExpectedNodes and Corpus.ExpectedEdges are left unset (0) and skipped
+// during benchmark validation.
+type RealisticCorpusSpec struct {
+	SourceFiles int
+}
+
+// realisticImportFanIn bounds how many earlier files each generated file imports
+// from, matching the small, bounded import counts seen in real workspaces rather
+// than a single unbounded chain.
+const realisticImportFanIn = 4
+
+func NewRealisticCorpusSpec(sourceFiles int) (RealisticCorpusSpec, error) {
+	if sourceFiles < 1 {
+		return RealisticCorpusSpec{}, fmt.Errorf("realistic corpus requires at least 1 source file")
+	}
+	return RealisticCorpusSpec{SourceFiles: sourceFiles}, nil
+}
+
+func GenerateRealisticCorpus(root string, specification RealisticCorpusSpec) (Corpus, error) {
+	return GenerateRealisticCorpusWithProgress(root, specification, nil)
+}
+
+func GenerateRealisticCorpusWithProgress(root string, specification RealisticCorpusSpec, progress func(created, total int)) (Corpus, error) {
+	if root == "" || specification.SourceFiles < 1 {
+		return Corpus{}, fmt.Errorf("generate realistic benchmark corpus: root and a positive source file count are required")
+	}
+
+	if err := os.WriteFile(filepath.Join(root, "package.json"), []byte(`{"name":"agent-graph-benchmark","type":"module"}`), 0o644); err != nil {
+		return Corpus{}, fmt.Errorf("generate realistic benchmark corpus: write package manifest: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Join(root, "src"), 0o755); err != nil {
+		return Corpus{}, fmt.Errorf("generate realistic benchmark corpus: create source directory: %w", err)
+	}
+
+	width := len(strconv.Itoa(specification.SourceFiles - 1))
+	for sourceIndex := 0; sourceIndex < specification.SourceFiles; sourceIndex++ {
+		path := modulePath(sourceIndex, width)
+		contents := realisticModuleContents(sourceIndex, width)
+		if err := os.WriteFile(filepath.Join(root, path), []byte(contents), 0o644); err != nil {
+			return Corpus{}, fmt.Errorf("generate realistic benchmark corpus: write source %q: %w", path, err)
+		}
+		if progress != nil {
+			progress(sourceIndex+1, specification.SourceFiles)
+		}
+	}
+
+	target := min(1, specification.SourceFiles-1)
+	entry := functionName(0, 0, width)
+	targetEntry := functionName(target, 0, width)
+	return Corpus{
+		SourceFiles: specification.SourceFiles,
+		UpdatePath:  modulePath(0, width),
+		QueryTerm:   entry,
+		PathSource:  "src/" + moduleName(0, width) + ".ts::" + entry,
+		PathTarget:  "src/" + moduleName(target, width) + ".ts::" + targetEntry,
+		ExplainTerm: entry,
+	}, nil
+}
+
+// realisticModuleContents writes one module with a bounded set of imports and a
+// mix of declaration kinds (function always, class/interface/type alias on a
+// period), matching the low per-file density and richer declaration mix of real
+// workspaces instead of hundreds of single-line trivial functions.
+func realisticModuleContents(sourceIndex, width int) string {
+	var contents strings.Builder
+	importSources := realisticImportSources(sourceIndex)
+	for _, importIndex := range importSources {
+		fmt.Fprintf(&contents, "import { %s } from './%s';\n", functionName(importIndex, 0, width), moduleName(importIndex, width))
+	}
+	if len(importSources) > 0 {
+		contents.WriteString("\n")
+	}
+
+	name := functionName(sourceIndex, 0, width)
+	contents.WriteString("// Computes a derived value for this module.\n")
+	fmt.Fprintf(&contents, "export function %s(): number {\n", name)
+	contents.WriteString("\tconst base = 1;\n")
+	if len(importSources) > 0 {
+		fmt.Fprintf(&contents, "\treturn base + %s();\n", functionName(importSources[0], 0, width))
+	} else {
+		contents.WriteString("\treturn base;\n")
+	}
+	contents.WriteString("}\n")
+
+	if sourceIndex%3 == 0 {
+		className := realisticDeclarationName("Cls", sourceIndex, width)
+		contents.WriteString("\n// Wraps the module function behind a small service class.\n")
+		fmt.Fprintf(&contents, "export class %s {\n", className)
+		contents.WriteString("\trun(): number {\n")
+		fmt.Fprintf(&contents, "\t\treturn %s();\n", name)
+		contents.WriteString("\t}\n")
+		contents.WriteString("}\n")
+	}
+	if sourceIndex%5 == 0 {
+		interfaceName := realisticDeclarationName("Iface", sourceIndex, width)
+		contents.WriteString("\n// Describes the shape returned by this module.\n")
+		fmt.Fprintf(&contents, "export interface %s {\n", interfaceName)
+		contents.WriteString("\tvalue: number;\n")
+		contents.WriteString("}\n")
+	}
+	if sourceIndex%7 == 0 {
+		typeName := realisticDeclarationName("Type", sourceIndex, width)
+		contents.WriteString("\n// Aliases the module's return shape.\n")
+		fmt.Fprintf(&contents, "export type %s = { value: number };\n", typeName)
+	}
+	if sourceIndex%11 == 0 {
+		envName := realisticDeclarationName("env", sourceIndex, width)
+		contents.WriteString("\n// Reads a build-time environment value, as real bundler-targeted modules do.\n")
+		fmt.Fprintf(&contents, "export const %s = (import.meta.env.BASE_URL || '').replace(/\\/+$/, '');\n", envName)
+	}
+	return contents.String()
+}
+
+// realisticImportSources returns up to realisticImportFanIn preceding file
+// indices, giving each file a small, bounded import fan-in instead of an
+// unbounded chain.
+func realisticImportSources(sourceIndex int) []int {
+	sources := make([]int, 0, realisticImportFanIn)
+	for offset := 1; offset <= realisticImportFanIn; offset++ {
+		candidate := sourceIndex - offset
+		if candidate < 0 {
+			break
+		}
+		sources = append(sources, candidate)
+	}
+	return sources
+}
+
+func realisticDeclarationName(prefix string, sourceIndex, width int) string {
+	return prefix + fmt.Sprintf("%0*d", width, sourceIndex)
+}
+
 func modulePath(sourceIndex, width int) string {
 	return filepath.Join("src", moduleName(sourceIndex, width)+".ts")
 }

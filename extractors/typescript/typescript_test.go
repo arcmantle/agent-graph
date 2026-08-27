@@ -197,6 +197,39 @@ func TestExtractProvidesConstantDynamicImportForResolution(t *testing.T) {
 	}
 }
 
+func TestExtractIgnoresStringLiteralsInsideDeclarationExports(t *testing.T) {
+	contribution, err := Extract(extractor.Source{
+		ProjectID:  "project:fixture",
+		SourcePath: "src/main.ts",
+		Contents:   []byte("export let baseUrl = (import.meta.env.BASE_URL || '').replace(/\\/+$/, '');"),
+	})
+	if err != nil {
+		t.Fatalf("extract TypeScript facts: %v", err)
+	}
+	if references := contribution.UnresolvedReferences(); len(references) != 0 {
+		t.Errorf("unresolved references = %+v, want none for a declaration export with no module source", references)
+	}
+}
+
+func TestExtractProvidesReExportForResolution(t *testing.T) {
+	contribution, err := Extract(extractor.Source{
+		ProjectID:  "project:fixture",
+		SourcePath: "src/main.ts",
+		Contents:   []byte("export { helper } from './support';"),
+	})
+	if err != nil {
+		t.Fatalf("extract TypeScript facts: %v", err)
+	}
+
+	references := contribution.UnresolvedReferences()
+	if len(references) != 1 {
+		t.Fatalf("unresolved reference count = %d, want 1", len(references))
+	}
+	if got := references[0].Target; got != "./support" {
+		t.Errorf("re-export target = %q, want %q", got, "./support")
+	}
+}
+
 func TestExtractReportsUnboundedDynamicImport(t *testing.T) {
 	contribution, err := Extract(extractor.Source{
 		ProjectID:  "project:fixture",
@@ -272,6 +305,46 @@ func TestExtractProvidesExportedSurfaceForNamedDeclaration(t *testing.T) {
 	}
 	if surfaces[0].Name != "helper" || surfaces[0].NodeID != contribution.Facts().Nodes[2].ID {
 		t.Errorf("exported surface = %+v, want helper for %q", surfaces[0], contribution.Facts().Nodes[2].ID)
+	}
+}
+
+func TestExtractProvidesSurfacesForMultipleDeclarationExports(t *testing.T) {
+	contribution, err := Extract(extractor.Source{
+		ProjectID:  "project:fixture",
+		SourcePath: "src/support.ts",
+		Contents: []byte(`
+export function first() {}
+export default function second() {}
+function third() {}
+export { third as renamed }
+export class Container { method() {} }
+`),
+	})
+	if err != nil {
+		t.Fatalf("extract TypeScript facts: %v", err)
+	}
+
+	nodeIDsByLabel := make(map[string]string)
+	for _, node := range contribution.Facts().Nodes {
+		nodeIDsByLabel[node.Label] = node.ID
+	}
+	surfaces := make(map[string]string)
+	for _, surface := range contribution.ExportedSurfaces() {
+		surfaces[surface.Name] = surface.NodeID
+	}
+	for name, label := range map[string]string{
+		"first":     "first",
+		"default":   "second",
+		"renamed":   "third",
+		"Container": "Container",
+		"method":    "method",
+	} {
+		if surfaces[name] != nodeIDsByLabel[label] {
+			t.Errorf("surface %q = %q, want node %q", name, surfaces[name], nodeIDsByLabel[label])
+		}
+	}
+	if len(surfaces) != 5 {
+		t.Errorf("exported surfaces = %+v, want five surfaces", contribution.ExportedSurfaces())
 	}
 }
 

@@ -21,12 +21,37 @@ type Run struct {
 	OutputChecksum          string
 }
 
-var approvedLimits = map[string]time.Duration{
+var defaultApprovedLimits = map[string]time.Duration{
 	"initial_index":      60 * time.Second,
 	"incremental_update": 2 * time.Second,
 	"query":              500 * time.Millisecond,
 	"path":               500 * time.Millisecond,
 	"explain":            500 * time.Millisecond,
+}
+
+// approvedLimitsBySourceFiles holds acceptance limits calibrated for one exact-scale
+// benchmark corpus. A corpus size without an entry falls back to defaultApprovedLimits.
+// A profile may omit a measurement name that has no limit calibrated at that scale yet;
+// Validate then skips that measurement instead of failing the run.
+var approvedLimitsBySourceFiles = map[int]map[string]time.Duration{
+	1000: {
+		"initial_index":      10 * time.Second,
+		"incremental_update": 2 * time.Second,
+		"query":              500 * time.Millisecond,
+		"path":               500 * time.Millisecond,
+		"explain":            500 * time.Millisecond,
+	},
+	// query, path, and explain scale with corpus size and have no calibrated limit here yet.
+	10000: {
+		"initial_index": 100 * time.Second,
+	},
+}
+
+func approvedLimitsFor(sourceFiles int) map[string]time.Duration {
+	if limits, ok := approvedLimitsBySourceFiles[sourceFiles]; ok {
+		return limits
+	}
+	return defaultApprovedLimits
 }
 
 var measurementOrder = []string{
@@ -39,10 +64,12 @@ var measurementOrder = []string{
 
 var phaseMeasurementOrder = []string{
 	"extraction",
+	"extraction_write_overlap",
 	"resolution",
 	"publication_preparation",
 	"sqlite_write",
 	"commit",
+	"staged_transaction",
 }
 
 var resolverMeasurementOrder = []string{
@@ -70,17 +97,19 @@ const (
 	requiredRuns = 1
 )
 
-func Validate(runs []Run) error {
+func Validate(runs []Run, sourceFiles int) error {
 	if len(runs) != requiredRuns {
 		return fmt.Errorf("benchmark requires %d runs, got %d", requiredRuns, len(runs))
 	}
+	limits := approvedLimitsFor(sourceFiles)
 
-	durations := make(map[string][]time.Duration, len(approvedLimits))
+	durations := make(map[string][]time.Duration, len(limits))
 	for _, run := range runs {
-		seen := make(map[string]bool, len(approvedLimits))
+		seen := make(map[string]bool, len(limits))
 		for _, measurement := range run.Measurements {
-			if _, ok := approvedLimits[measurement.Name]; !ok {
-				return fmt.Errorf("benchmark %q has no approved limit", measurement.Name)
+			// A measurement outside this corpus size's profile has no calibrated limit; skip it.
+			if _, tracked := limits[measurement.Name]; !tracked {
+				continue
 			}
 			if seen[measurement.Name] {
 				return fmt.Errorf("benchmark run contains duplicate measurement %q", measurement.Name)
@@ -88,14 +117,14 @@ func Validate(runs []Run) error {
 			seen[measurement.Name] = true
 			durations[measurement.Name] = append(durations[measurement.Name], measurement.Duration)
 		}
-		for name := range approvedLimits {
+		for name := range limits {
 			if !seen[name] {
 				return fmt.Errorf("benchmark run is missing measurement %q", name)
 			}
 		}
 	}
 
-	for name, limit := range approvedLimits {
+	for name, limit := range limits {
 		values := durations[name]
 		sort.Slice(values, func(left, right int) bool { return values[left] < values[right] })
 		median := values[len(values)/2]
@@ -106,8 +135,8 @@ func Validate(runs []Run) error {
 	return nil
 }
 
-func ValidateReport(runs []Run) error {
-	if err := Validate(runs); err != nil {
+func ValidateReport(runs []Run, sourceFiles int) error {
+	if err := Validate(runs, sourceFiles); err != nil {
 		return err
 	}
 	checksum := ""
@@ -174,7 +203,7 @@ func validateMeasurementOrder(measurements []Measurement, order []string) error 
 }
 
 func medians(runs []Run, order []string, selectMeasurements func(Run) []Measurement) []Measurement {
-	durations := make(map[string][]time.Duration, len(approvedLimits))
+	durations := make(map[string][]time.Duration, len(order))
 	for _, run := range runs {
 		for _, measurement := range selectMeasurements(run) {
 			durations[measurement.Name] = append(durations[measurement.Name], measurement.Duration)

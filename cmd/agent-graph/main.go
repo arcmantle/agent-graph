@@ -126,6 +126,7 @@ func benchmarkFlags(command *cobra.Command) {
 	formatFlag(command)
 	command.Flags().Int("source-files", benchmark.DefaultCorpusSpec.SourceFiles, "generated source file count")
 	command.Flags().Int("functions-per-file", benchmark.DefaultCorpusSpec.FunctionsPerFile, "generated minimum function count per source file")
+	command.Flags().Bool("realistic", false, "generate a realistic-density corpus (bounded imports, mixed declaration kinds) instead of the dense linear-chain corpus; ignores --functions-per-file")
 	command.Flags().String("cpu-profile", "", "write an initial-index CPU profile to this file")
 }
 
@@ -360,9 +361,23 @@ func runBenchmark(command *cobra.Command, arguments []string, standardOutput, st
 	if err != nil {
 		return writeCommandError(standardError, err)
 	}
+	realistic, err := command.Flags().GetBool("realistic")
+	if err != nil {
+		return writeCommandError(standardError, err)
+	}
 	var benchmarkWorkspace string
 	var corpus benchmark.Corpus
-	if len(arguments) == 0 {
+	if len(arguments) == 0 && realistic {
+		sourceFiles, err := command.Flags().GetInt("source-files")
+		if err != nil {
+			return writeCommandError(standardError, err)
+		}
+		benchmarkWorkspace, corpus, err = prepareRealisticBenchmarkCorpus(sourceFiles, standardError)
+		if err != nil {
+			return writeCommandError(standardError, err)
+		}
+		defer os.RemoveAll(benchmarkWorkspace)
+	} else if len(arguments) == 0 {
 		specification, err := benchmarkCorpusSpec(command)
 		if err != nil {
 			return writeCommandError(standardError, err)
@@ -433,7 +448,7 @@ func runBenchmark(command *cobra.Command, arguments []string, standardOutput, st
 	if err := cli.Render(standardOutput, cli.Result{Snapshot: snapshot, Text: renderBenchmarkText(data), Data: data}, format); err != nil {
 		return writeCommandError(standardError, err)
 	}
-	if err := benchmark.ValidateReport(runs); err != nil {
+	if err := benchmark.ValidateReport(runs, corpus.SourceFiles); err != nil {
 		return writeCommandError(standardError, err)
 	}
 	return 0
@@ -485,6 +500,36 @@ func prepareBenchmarkCorpus(specification benchmark.CorpusSpec, standardError io
 	}
 
 	fmt.Fprintf(standardError, "Benchmark setup: corpus expects %d nodes and %d edges; run 1 will validate the indexed result\n", corpus.ExpectedNodes, corpus.ExpectedEdges)
+	return workspace, corpus, nil
+}
+
+func prepareRealisticBenchmarkCorpus(sourceFiles int, standardError io.Writer) (string, benchmark.Corpus, error) {
+	specification, err := benchmark.NewRealisticCorpusSpec(sourceFiles)
+	if err != nil {
+		return "", benchmark.Corpus{}, cli.NewInvalidArgumentError(err.Error())
+	}
+	workspace, err := os.MkdirTemp("", "agent-graph-benchmark-")
+	if err != nil {
+		return "", benchmark.Corpus{}, fmt.Errorf("create benchmark workspace: %w", err)
+	}
+	lastReported := 0
+	fmt.Fprintf(standardError, "Benchmark setup: generate %d realistic source files\n", specification.SourceFiles)
+	corpus, err := benchmark.GenerateRealisticCorpusWithProgress(workspace, specification, func(created, total int) {
+		if created == total || created-lastReported >= 1000 {
+			fmt.Fprintf(standardError, "Benchmark setup: generated %d/%d source files\n", created, total)
+			lastReported = created
+		}
+	})
+	if err != nil {
+		os.RemoveAll(workspace)
+		return "", benchmark.Corpus{}, err
+	}
+	if err := os.MkdirAll(filepath.Join(workspace, ".agent-graph"), 0o755); err != nil {
+		os.RemoveAll(workspace)
+		return "", benchmark.Corpus{}, fmt.Errorf("create benchmark database directory: %w", err)
+	}
+
+	fmt.Fprintln(standardError, "Benchmark setup: realistic corpus node and edge counts are data-derived; skipping exact-count validation")
 	return workspace, corpus, nil
 }
 

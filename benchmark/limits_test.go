@@ -21,7 +21,7 @@ func TestValidateAcceptsOneInLimitRun(t *testing.T) {
 		{Measurements: measurements(60*time.Second, 2*time.Second, 500*time.Millisecond, 500*time.Millisecond, 500*time.Millisecond)},
 	}
 
-	if err := benchmark.Validate(runs); err != nil {
+	if err := benchmark.Validate(runs, 42); err != nil {
 		t.Fatalf("validate in-limit medians: %v", err)
 	}
 }
@@ -31,7 +31,7 @@ func TestValidateRejectsMedianAboveApprovedLimit(t *testing.T) {
 		{Measurements: measurements(61*time.Second, 2*time.Second, 200*time.Millisecond, 200*time.Millisecond, 200*time.Millisecond)},
 	}
 
-	err := benchmark.Validate(runs)
+	err := benchmark.Validate(runs, 42)
 	if err == nil {
 		t.Fatal("validate over-limit median succeeded")
 	}
@@ -40,12 +40,50 @@ func TestValidateRejectsMedianAboveApprovedLimit(t *testing.T) {
 	}
 }
 
+func TestValidateUsesTenSecondInitialIndexLimitForOneThousandFileCorpus(t *testing.T) {
+	runs := []benchmark.Run{
+		{Measurements: measurements(11*time.Second, 2*time.Second, 500*time.Millisecond, 500*time.Millisecond, 500*time.Millisecond)},
+	}
+
+	err := benchmark.Validate(runs, 1000)
+	if err == nil {
+		t.Fatal("validate over-limit 1000-file median succeeded")
+	}
+	if !strings.Contains(err.Error(), "initial_index") || !strings.Contains(err.Error(), "10s") {
+		t.Errorf("validate error = %q, want initial_index and the 10s approved limit", err)
+	}
+
+	runs[0].Measurements[0].Duration = 9 * time.Second
+	if err := benchmark.Validate(runs, 1000); err != nil {
+		t.Fatalf("validate in-limit 1000-file median: %v", err)
+	}
+}
+
+func TestValidateUsesOneHundredSecondInitialIndexLimitForTenThousandFileCorpusAndSkipsUncalibratedMeasurements(t *testing.T) {
+	runs := []benchmark.Run{
+		{Measurements: measurements(99*time.Second, time.Hour, time.Hour, time.Hour, time.Hour)},
+	}
+
+	if err := benchmark.Validate(runs, 10000); err != nil {
+		t.Fatalf("validate 10000-file median with uncalibrated measurements: %v", err)
+	}
+
+	runs[0].Measurements[0].Duration = 101 * time.Second
+	err := benchmark.Validate(runs, 10000)
+	if err == nil {
+		t.Fatal("validate over-limit 10000-file median succeeded")
+	}
+	if !strings.Contains(err.Error(), "initial_index") || !strings.Contains(err.Error(), "1m40s") {
+		t.Errorf("validate error = %q, want initial_index and the 100s approved limit", err)
+	}
+}
+
 func TestValidateReportRejectsMissingRunMetadata(t *testing.T) {
 	runs := []benchmark.Run{
 		{Measurements: measurements(time.Second, time.Second, time.Millisecond, time.Millisecond, time.Millisecond), PhaseMeasurements: phaseMeasurements(), ResolverMeasurements: resolverMeasurements(), SQLiteWriteMeasurements: sqliteWriteMeasurements()},
 	}
 
-	err := benchmark.ValidateReport(runs)
+	err := benchmark.ValidateReport(runs, 42)
 	if err == nil {
 		t.Fatal("validate report with missing metadata succeeded")
 	}
@@ -59,7 +97,7 @@ func TestValidateReportRejectsDifferentChecksums(t *testing.T) {
 		{Measurements: measurements(time.Second, time.Second, time.Millisecond, time.Millisecond, time.Millisecond)},
 	}
 
-	err := benchmark.ValidateReport(runs)
+	err := benchmark.ValidateReport(runs, 42)
 	if err == nil {
 		t.Fatal("validate report with incomplete run metadata succeeded")
 	}
@@ -78,7 +116,7 @@ func TestValidateReportRejectsIncompletePhaseMeasurements(t *testing.T) {
 		OutputChecksum:          "sha256:stable",
 	}}
 
-	err := benchmark.ValidateReport(runs)
+	err := benchmark.ValidateReport(runs, 42)
 	if err == nil {
 		t.Fatal("validate report without indexing phases succeeded")
 	}
@@ -112,7 +150,7 @@ func TestValidateReportRejectsInvalidResolverMeasurements(t *testing.T) {
 				OutputChecksum:          "sha256:stable",
 			}}
 
-			err := benchmark.ValidateReport(runs)
+			err := benchmark.ValidateReport(runs, 42)
 			if err == nil {
 				t.Fatal("validate report with invalid resolver measurements succeeded")
 			}
@@ -239,6 +277,85 @@ func TestGeneratedCorpusProducesExpectedGraphEvidence(t *testing.T) {
 	}
 }
 
+func TestGenerateRealisticCorpusCreatesDeterministicBoundedFanIn(t *testing.T) {
+	firstRoot := t.TempDir()
+	secondRoot := t.TempDir()
+	specification, err := benchmark.NewRealisticCorpusSpec(9)
+	if err != nil {
+		t.Fatalf("create realistic corpus specification: %v", err)
+	}
+
+	first, err := benchmark.GenerateRealisticCorpus(firstRoot, specification)
+	if err != nil {
+		t.Fatalf("generate first realistic corpus: %v", err)
+	}
+	second, err := benchmark.GenerateRealisticCorpus(secondRoot, specification)
+	if err != nil {
+		t.Fatalf("generate second realistic corpus: %v", err)
+	}
+	if first != second {
+		t.Errorf("realistic corpus metadata differs: first = %+v, second = %+v", first, second)
+	}
+
+	for sourceIndex := 0; sourceIndex < specification.SourceFiles; sourceIndex++ {
+		path := filepath.Join("src", "module-"+strconv.Itoa(sourceIndex)+".ts")
+		contents, err := os.ReadFile(filepath.Join(firstRoot, path))
+		if err != nil {
+			t.Fatalf("read source %q: %v", path, err)
+		}
+		if got := strings.Count(string(contents), "import {"); got > 4 {
+			t.Errorf("source %d import count = %d, want at most 4", sourceIndex, got)
+		}
+	}
+
+	// Source 0 sits at index%3, index%5, index%7, and index%11, so it carries the full declaration mix.
+	rootContents, err := os.ReadFile(filepath.Join(firstRoot, "src", "module-0.ts"))
+	if err != nil {
+		t.Fatalf("read source 0: %v", err)
+	}
+	for _, want := range []string{"export function", "export class", "export interface", "export type", "import.meta.env"} {
+		if !strings.Contains(string(rootContents), want) {
+			t.Errorf("source 0 = %q, want it to contain %q", rootContents, want)
+		}
+	}
+}
+
+func TestGenerateRealisticCorpusIndexesWithoutError(t *testing.T) {
+	root := t.TempDir()
+	specification, err := benchmark.NewRealisticCorpusSpec(12)
+	if err != nil {
+		t.Fatalf("create realistic corpus specification: %v", err)
+	}
+	corpus, err := benchmark.GenerateRealisticCorpus(root, specification)
+	if err != nil {
+		t.Fatalf("generate realistic corpus: %v", err)
+	}
+	if corpus.ExpectedNodes != 0 || corpus.ExpectedEdges != 0 {
+		t.Errorf("realistic corpus expected counts = %d nodes and %d edges, want 0 and 0 (data-derived)", corpus.ExpectedNodes, corpus.ExpectedEdges)
+	}
+
+	store, err := sqlite.Open(context.Background(), filepath.Join(t.TempDir(), "benchmark.db"))
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	defer store.Close()
+
+	result, err := index.Index(context.Background(), store, index.Request{Root: root})
+	if err != nil {
+		t.Fatalf("index realistic corpus: %v", err)
+	}
+	facts := graph.Facts{}
+	if err := store.Export(context.Background(), result.Snapshot, storage.ExportRequest{}, factCollector{facts: &facts}); err != nil {
+		t.Fatalf("export realistic corpus facts: %v", err)
+	}
+	if len(facts.Nodes) == 0 || len(facts.Edges) == 0 {
+		t.Errorf("realistic corpus produced %d nodes and %d edges, want more than 0 of each", len(facts.Nodes), len(facts.Edges))
+	}
+	if !containsNode(facts.Nodes, corpus.PathSource) || !containsNode(facts.Nodes, corpus.PathTarget) || !containsNode(facts.Nodes, corpus.ExplainTerm) {
+		t.Errorf("graph nodes do not contain benchmark targets: %+v", facts.Nodes)
+	}
+}
+
 type factCollector struct {
 	facts *graph.Facts
 }
@@ -275,10 +392,12 @@ func measurements(initialIndex, incrementalUpdate, query, path, explain time.Dur
 func phaseMeasurements() []benchmark.Measurement {
 	return []benchmark.Measurement{
 		{Name: "extraction", Duration: time.Millisecond},
+		{Name: "extraction_write_overlap", Duration: time.Millisecond},
 		{Name: "resolution", Duration: time.Millisecond},
 		{Name: "publication_preparation", Duration: time.Millisecond},
 		{Name: "sqlite_write", Duration: time.Millisecond},
 		{Name: "commit", Duration: time.Millisecond},
+		{Name: "staged_transaction", Duration: time.Millisecond},
 	}
 }
 

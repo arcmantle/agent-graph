@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"sort"
 	"strconv"
 	"strings"
 
@@ -416,6 +417,9 @@ func moduleBindings(source extractor.Source, node *sitter.Node) []extractor.Modu
 
 func collectExportedSurfaces(source extractor.Source, exports []*sitter.Node, declarations []declaration) []extractor.ExportedSurface {
 	surfaces := make([]extractor.ExportedSurface, 0)
+	sort.SliceStable(declarations, func(left, right int) bool {
+		return declarations[left].node.StartByte() < declarations[right].node.StartByte()
+	})
 	byName := make(map[string]declaration, len(declarations))
 	for _, declaration := range declarations {
 		byName[declaration.name] = declaration
@@ -431,10 +435,17 @@ func collectExportedSurfaces(source extractor.Source, exports []*sitter.Node, de
 	}
 	for _, exportedStatement := range exports {
 		if exported := exportedStatement.ChildByFieldName("declaration"); exported != nil {
-			for _, declaration := range declarations {
-				if declaration.node.StartByte() >= exported.StartByte() && declaration.node.EndByte() <= exported.EndByte() {
+			defaultExport := strings.HasPrefix(strings.TrimSpace(exportedStatement.Utf8Text(source.Contents)), "export default")
+			firstDeclaration := sort.Search(len(declarations), func(index int) bool {
+				return declarations[index].node.StartByte() >= exported.StartByte()
+			})
+			for _, declaration := range declarations[firstDeclaration:] {
+				if declaration.node.StartByte() > exported.EndByte() {
+					break
+				}
+				if declaration.node.EndByte() <= exported.EndByte() {
 					name := declaration.name
-					if strings.HasPrefix(strings.TrimSpace(exportedStatement.Utf8Text(source.Contents)), "export default") {
+					if defaultExport {
 						name = "default"
 					}
 					appendSurface(name, declaration)
@@ -471,6 +482,10 @@ func moduleReferenceKind(source extractor.Source, node *sitter.Node) (extractor.
 	case "import_statement":
 		return extractor.ModuleReferenceImport, true
 	case "export_statement":
+		// A declaration export (export function/const/class/...) has no source clause and re-exports nothing.
+		if node.ChildByFieldName("source") == nil {
+			return "", false
+		}
 		return extractor.ModuleReferenceReExport, true
 	case "call_expression":
 		function := node.ChildByFieldName("function")
@@ -517,22 +532,11 @@ func moduleSpecifiers(source extractor.Source, node *sitter.Node) ([]moduleSpeci
 }
 
 func staticModuleSpecifier(source extractor.Source, node *sitter.Node) (string, bool) {
-	var specifier *sitter.Node
-	var visit func(*sitter.Node)
-	visit = func(current *sitter.Node) {
-		if specifier != nil {
-			return
-		}
-		if current.Kind() == "string" {
-			specifier = current
-			return
-		}
-		for childIndex := uint(0); childIndex < current.NamedChildCount(); childIndex++ {
-			visit(current.NamedChild(childIndex))
-		}
+	specifier := node
+	if node.Kind() != "string" {
+		specifier = node.ChildByFieldName("source")
 	}
-	visit(node)
-	if specifier == nil {
+	if specifier == nil || specifier.Kind() != "string" {
 		return "", false
 	}
 
