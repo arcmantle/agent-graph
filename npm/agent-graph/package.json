@@ -1,0 +1,35 @@
+{
+	"name": "@arcmantle/agent-graph",
+	"version": "0.1.0",
+	"description": "Install and run the agent-graph code graph CLI.",
+	"bin": {
+		"agent-graph": "bin/agent-graph.js"
+	},
+	"files": [
+		"bin/agent-graph.js",
+		"scripts/install.js"
+	],
+	"engines": {
+		"node": ">=18"
+	},
+	"os": [
+		"darwin",
+		"linux",
+		"win32"
+	],
+	"scripts": {
+		"postinstall": "node scripts/install.js",
+		"test": "node --test"
+	},
+	"repository": {
+		"type": "git",
+		"url": "git+https://github.com/arcmantle/agent-graph.git"
+	},
+	"bugs": {
+		"url": "https://github.com/arcmantle/agent-graph/issues"
+	},
+	"homepage": "https://github.com/arcmantle/agent-graph#readme",
+	"publishConfig": {
+		"access": "public"
+	}
+}

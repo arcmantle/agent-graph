@@ -1,0 +1,114 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*'
+
+permissions:
+  contents: write
+
+jobs:
+  build:
+    name: Build ${{ matrix.platform }}-${{ matrix.architecture }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-latest
+            platform: linux
+            architecture: x64
+          - runner: macos-13
+            platform: darwin
+            architecture: x64
+          - runner: macos-14
+            platform: darwin
+            architecture: arm64
+          - runner: ubuntu-latest
+            platform: win32
+            architecture: x64
+            goos: windows
+            extension: .exe
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v6
+        with:
+          go-version: '1.25.0'
+          check-latest: true
+      - name: Install C toolchain
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes build-essential mingw-w64
+      - name: Build binary
+        env:
+          GOOS: ${{ matrix.goos }}
+          GOARCH: ${{ matrix.architecture == 'x64' && 'amd64' || matrix.architecture }}
+          CC: ${{ matrix.platform == 'win32' && 'x86_64-w64-mingw32-gcc' || '' }}
+        run: CGO_ENABLED=1 go build -trimpath -ldflags="-s -w" -o dist/agent-graph${{ matrix.extension }} ./cmd/agent-graph
+      - name: Create release asset
+        env:
+          ASSET_NAME: agent-graph-${{ matrix.platform }}-${{ matrix.architecture }}.gz
+        run: |
+          gzip -9 -c dist/agent-graph${{ matrix.extension }} > "$ASSET_NAME"
+          shasum -a 256 "$ASSET_NAME" > "$ASSET_NAME.sha256"
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ matrix.platform }}-${{ matrix.architecture }}
+          path: agent-graph-*.gz*
+          if-no-files-found: error
+
+  release:
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          merge-multiple: true
+          path: release-assets
+      - name: Publish GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.ref_name }}
+        run: |
+          cat release-assets/*.sha256 > release-assets/SHA256SUMS
+          rm release-assets/*.sha256
+          gh release create "$TAG" --verify-tag --generate-notes release-assets/*
+
+  npm:
+    needs: release
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          registry-url: https://registry.npmjs.org
+      - name: Validate package version
+        working-directory: npm/agent-graph
+        env:
+          TAG: ${{ github.ref_name }}
+        run: test "v$(node -p \"require('./package.json').version\")" = "$TAG"
+      - name: Test npm package
+        working-directory: npm/agent-graph
+        run: npm test
+      - name: Publish npm package
+        working-directory: npm/agent-graph
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish
+      - name: Validate unscoped package version
+        working-directory: npm/agent-graph-unscoped
+        env:
+          TAG: ${{ github.ref_name }}
+        run: test "v$(node -p \"require('./package.json').version\")" = "$TAG"
+      - name: Test unscoped npm package
+        working-directory: npm/agent-graph-unscoped
+        run: npm test
+      - name: Publish unscoped npm package
+        working-directory: npm/agent-graph-unscoped
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: npm publish
