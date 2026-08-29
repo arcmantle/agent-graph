@@ -1,6 +1,7 @@
 package workspace
 
 import (
+	"context"
 	"fmt"
 	"io/fs"
 	"os"
@@ -8,6 +9,8 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+
+	gitignore "github.com/sabhiram/go-gitignore"
 )
 
 type DiscoverOptions struct {
@@ -34,26 +37,55 @@ type ignoreRule struct {
 	include bool
 }
 
+type gitIgnoreRule struct {
+	root     string
+	patterns []gitIgnorePattern
+}
+
+type gitIgnorePattern struct {
+	matcher *gitignore.GitIgnore
+	negated bool
+}
+
+type ignoreRules struct {
+	agraph     []ignoreRule
+	gitIgnores []gitIgnoreRule
+}
+
 func Discover(root string, options DiscoverOptions) (Discovery, error) {
+	sources := make([]Source, 0)
+	projects, _, err := DiscoverStream(context.Background(), root, options, func(source Source) error {
+		sources = append(sources, source)
+		return nil
+	})
+	if err != nil {
+		return Discovery{}, err
+	}
+	return Discovery{Projects: projects, Sources: sources}, nil
+}
+
+func DiscoverStream(ctx context.Context, root string, options DiscoverOptions, emit func(Source) error) ([]Project, int, error) {
 	workspaceRoot, err := filepath.Abs(root)
 	if err != nil {
-		return Discovery{}, fmt.Errorf("resolve workspace root: %w", err)
+		return nil, 0, fmt.Errorf("resolve workspace root: %w", err)
 	}
 	ignoreRules, err := loadIgnoreRules(workspaceRoot)
 	if err != nil {
-		return Discovery{}, err
+		return nil, 0, err
 	}
 
 	projectRoots := make([]string, 0, len(options.ConfiguredRoots))
 	for _, configuredRoot := range options.ConfiguredRoots {
 		normalizedRoot, err := normalizeRoot(workspaceRoot, configuredRoot)
 		if err != nil {
-			return Discovery{}, err
+			return nil, 0, err
 		}
 		projectRoots = append(projectRoots, normalizedRoot)
 	}
-	sourcePaths := make([]string, 0)
 	if err := filepath.WalkDir(workspaceRoot, func(path string, entry fs.DirEntry, walkErr error) error {
+		if err := ctx.Err(); err != nil {
+			return err
+		}
 		if walkErr != nil {
 			return walkErr
 		}
@@ -72,41 +104,63 @@ func Discover(root string, options DiscoverOptions) (Discovery, error) {
 		if projectManifest(filepath.Base(path)) {
 			projectRoots = append(projectRoots, projectRoot(relativePath))
 		}
-		if supportedSource(relativePath) {
-			sourcePaths = append(sourcePaths, relativePath)
-		}
 		return nil
 	}); err != nil {
-		return Discovery{}, fmt.Errorf("walk workspace: %w", err)
+		return nil, 0, fmt.Errorf("walk workspace for projects: %w", err)
 	}
 
 	projectRoots = uniqueSorted(projectRoots)
-	sort.Strings(sourcePaths)
-
 	projects := make([]Project, len(projectRoots))
 	for index, root := range projectRoots {
 		projects[index] = Project{ID: projectID(root), Root: root}
 	}
 
-	sources := make([]Source, 0, len(sourcePaths))
-	for _, sourcePath := range sourcePaths {
-		ownerRoot, found := mostSpecificRoot(sourcePath, projectRoots)
-		if !found {
-			continue
+	sourceCount := 0
+	if err := filepath.WalkDir(workspaceRoot, func(path string, entry fs.DirEntry, walkErr error) error {
+		if err := ctx.Err(); err != nil {
+			return err
 		}
-		sources = append(sources, Source{Path: sourcePath, ProjectID: projectID(ownerRoot)})
+		if walkErr != nil {
+			return walkErr
+		}
+		if entry.IsDir() {
+			return nil
+		}
+		relativePath, err := filepath.Rel(workspaceRoot, path)
+		if err != nil {
+			return fmt.Errorf("make path relative: %w", err)
+		}
+		relativePath = filepath.ToSlash(relativePath)
+		if sourceExcluded(relativePath, ignoreRules) || !supportedSource(relativePath) {
+			return nil
+		}
+		ownerRoot, found := mostSpecificRoot(relativePath, projectRoots)
+		if !found {
+			return nil
+		}
+		if err := emit(Source{Path: relativePath, ProjectID: projectID(ownerRoot)}); err != nil {
+			return err
+		}
+		sourceCount++
+		return nil
+	}); err != nil {
+		return nil, sourceCount, fmt.Errorf("walk workspace for sources: %w", err)
 	}
-
-	return Discovery{Projects: projects, Sources: sources}, nil
+	return projects, sourceCount, nil
 }
 
-func loadIgnoreRules(workspaceRoot string) ([]ignoreRule, error) {
+func loadIgnoreRules(workspaceRoot string) (ignoreRules, error) {
+	gitIgnores, err := loadGitIgnoreRules(workspaceRoot)
+	if err != nil {
+		return ignoreRules{}, err
+	}
+
 	contents, err := os.ReadFile(filepath.Join(workspaceRoot, ".agraphignore"))
 	if os.IsNotExist(err) {
-		return nil, nil
+		return ignoreRules{gitIgnores: gitIgnores}, nil
 	}
 	if err != nil {
-		return nil, fmt.Errorf("read root .agraphignore: %w", err)
+		return ignoreRules{}, fmt.Errorf("read root .agraphignore: %w", err)
 	}
 
 	lines := strings.Split(string(contents), "\n")
@@ -124,21 +178,121 @@ func loadIgnoreRules(workspaceRoot string) ([]ignoreRule, error) {
 			rules = append(rules, ignoreRule{pattern: pattern, include: include})
 		}
 	}
-	return rules, nil
+	return ignoreRules{agraph: rules, gitIgnores: gitIgnores}, nil
 }
 
-func sourceExcluded(sourcePath string, rules []ignoreRule) bool {
+func sourceExcluded(sourcePath string, rules ignoreRules) bool {
 	if internalDirectory(sourcePath) {
+		return true
+	}
+	if gitIgnored(sourcePath, rules.gitIgnores) {
 		return true
 	}
 
 	excluded := false
-	for _, rule := range rules {
+	for _, rule := range rules.agraph {
 		if ignorePatternMatches(sourcePath, rule.pattern) {
 			excluded = !rule.include
 		}
 	}
 	return excluded
+}
+
+func loadGitIgnoreRules(workspaceRoot string) ([]gitIgnoreRule, error) {
+	rules := make([]gitIgnoreRule, 0)
+	if err := filepath.WalkDir(workspaceRoot, func(path string, entry fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		relativePath, err := filepath.Rel(workspaceRoot, path)
+		if err != nil {
+			return fmt.Errorf("make Git ignore path relative: %w", err)
+		}
+		relativePath = filepath.ToSlash(relativePath)
+		if entry.IsDir() {
+			if relativePath != "." && internalDirectory(relativePath) {
+				return filepath.SkipDir
+			}
+			return nil
+		}
+		if entry.Name() != ".gitignore" {
+			return nil
+		}
+		patterns, err := loadGitIgnorePatterns(path)
+		if err != nil {
+			return fmt.Errorf("read Git ignore file %q: %w", relativePath, err)
+		}
+		rules = append(rules, gitIgnoreRule{root: filepath.ToSlash(filepath.Dir(relativePath)), patterns: patterns})
+		return nil
+	}); err != nil {
+		return nil, fmt.Errorf("walk workspace for Git ignore files: %w", err)
+	}
+	sort.Slice(rules, func(left, right int) bool { return rules[left].root < rules[right].root })
+	return rules, nil
+}
+
+func loadGitIgnorePatterns(path string) ([]gitIgnorePattern, error) {
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		return nil, err
+	}
+	patterns := make([]gitIgnorePattern, 0)
+	for _, line := range strings.Split(string(contents), "\n") {
+		pattern := strings.TrimSpace(line)
+		if pattern == "" || strings.HasPrefix(pattern, "#") {
+			continue
+		}
+		negated := strings.HasPrefix(pattern, "!")
+		lines := []string{pattern}
+		if negated {
+			lines = append([]string{"*"}, lines...)
+		}
+		patterns = append(patterns, gitIgnorePattern{
+			matcher: gitignore.CompileIgnoreLines(lines...),
+			negated: negated,
+		})
+	}
+	return patterns, nil
+}
+
+func gitIgnored(sourcePath string, rules []gitIgnoreRule) bool {
+	for directory := path.Dir(sourcePath); directory != "."; directory = path.Dir(directory) {
+		if gitIgnoredPath(directory, true, rules) {
+			return true
+		}
+	}
+	return gitIgnoredPath(sourcePath, false, rules)
+}
+
+func gitIgnoredPath(sourcePath string, directory bool, rules []gitIgnoreRule) bool {
+	excluded := false
+	for _, rule := range rules {
+		relativePath := sourcePath
+		if rule.root != "." {
+			if !strings.HasPrefix(sourcePath, rule.root+"/") {
+				continue
+			}
+			relativePath = strings.TrimPrefix(sourcePath, rule.root+"/")
+		}
+		for _, pattern := range rule.patterns {
+			if !matchesGitIgnorePattern(pattern, relativePath, directory) {
+				continue
+			}
+			excluded = !pattern.negated
+		}
+	}
+	return excluded
+}
+
+func matchesGitIgnorePattern(pattern gitIgnorePattern, sourcePath string, directory bool) bool {
+	if directory {
+		sourcePath += "/"
+	}
+	matched := pattern.matcher.MatchesPath(sourcePath)
+	if pattern.negated {
+		return !matched
+	}
+	return matched
 }
 
 func internalDirectory(sourcePath string) bool {
