@@ -156,3 +156,11 @@ make acceptance
 ```
 
 This command runs the storage conformance, extraction, indexing, query, path, explain, export, lifecycle, fixture, and Graphify comparison checks.
+
+## ClientFlex Acceptance
+
+The ClientFlex acceptance test is opt-in because the corpus is private and external. It uses a temporary SQLite database and does not write graph artifacts to the corpus.
+
+```bash
+AGENT_GRAPH_CLIENTFLEX_ROOT=/path/to/ClientFlex CGO_ENABLED=1 go test ./acceptance -run '^TestClientFlexAcceptanceIndexesIntoTemporaryDatabase$' -v
+```
