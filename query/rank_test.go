@@ -96,6 +96,70 @@ func TestRankSnapshotReadsNodesFromOnePublishedSnapshot(t *testing.T) {
 	}
 }
 
+func TestRankSnapshotPrefersExactMatches(t *testing.T) {
+	snapshot := storage.Snapshot{Workspace: "workspace", Version: 7}
+	exact := graph.Node{ID: "function:main", Label: "main", QualifiedName: "src/main.ts::main"}
+	exactMatches := []storage.NodeMatch{
+		{Node: exact},
+		{Node: graph.Node{ID: "function:other", Label: "main", QualifiedName: "src/other.ts::main"}},
+		{Node: graph.Node{ID: "function:third", Label: "main", QualifiedName: "src/third.ts::main"}},
+		{Node: graph.Node{ID: "function:fourth", Label: "main", QualifiedName: "src/fourth.ts::main"}},
+	}
+	lookup := exactNodeLookup{
+		nodeLookupFunc: nodeLookupFunc(func(context.Context, storage.Snapshot, storage.NodeLookupRequest) ([]storage.NodeMatch, error) {
+			t.Fatal("broad lookup is called when exact lookup finds a match")
+			return nil, nil
+		}),
+		exact: func(_ context.Context, gotSnapshot storage.Snapshot, identifier string) ([]storage.NodeMatch, error) {
+			if gotSnapshot != snapshot {
+				t.Errorf("snapshot = %+v, want %+v", gotSnapshot, snapshot)
+			}
+			if identifier != exact.QualifiedName {
+				t.Errorf("exact lookup identifier = %q, want %q", identifier, exact.QualifiedName)
+			}
+			return exactMatches, nil
+		},
+	}
+
+	seeds, err := query.RankSnapshot(context.Background(), lookup, snapshot, []string{exact.QualifiedName})
+	if err != nil {
+		t.Fatalf("rank snapshot: %v", err)
+	}
+	if got, want := nodeIDs(seeds[0].Nodes), []string{exact.ID, "function:other", "function:third"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("exact seed IDs = %v, want %v", got, want)
+	}
+}
+
+func TestRankSnapshotFallsBackToBroadLookupAfterExactMiss(t *testing.T) {
+	snapshot := storage.Snapshot{Workspace: "workspace", Version: 7}
+	broad := graph.Node{ID: "function:main", Label: "main", QualifiedName: "src/main.ts::main"}
+	lookup := exactNodeLookup{
+		nodeLookupFunc: nodeLookupFunc(func(_ context.Context, gotSnapshot storage.Snapshot, request storage.NodeLookupRequest) ([]storage.NodeMatch, error) {
+			if gotSnapshot != snapshot {
+				t.Errorf("snapshot = %+v, want %+v", gotSnapshot, snapshot)
+			}
+			if request.Text != "main" || request.Limit != 3 {
+				t.Errorf("broad lookup request = %+v, want main with limit 3", request)
+			}
+			return []storage.NodeMatch{{Node: broad}}, nil
+		}),
+		exact: func(_ context.Context, _ storage.Snapshot, identifier string) ([]storage.NodeMatch, error) {
+			if identifier != "main" {
+				t.Errorf("exact lookup identifier = %q, want main", identifier)
+			}
+			return nil, nil
+		},
+	}
+
+	seeds, err := query.RankSnapshot(context.Background(), lookup, snapshot, []string{"main"})
+	if err != nil {
+		t.Fatalf("rank snapshot: %v", err)
+	}
+	if got, want := nodeIDs(seeds[0].Nodes), []string{broad.ID}; !reflect.DeepEqual(got, want) {
+		t.Errorf("broad fallback seed IDs = %v, want %v", got, want)
+	}
+}
+
 type exporterFunc func(context.Context, storage.Snapshot, storage.ExportRequest, storage.ExportSink) error
 
 func (export exporterFunc) Export(ctx context.Context, snapshot storage.Snapshot, request storage.ExportRequest, sink storage.ExportSink) error {

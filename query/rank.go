@@ -47,7 +47,7 @@ func RankSnapshot(ctx context.Context, lookup storage.NodeLookup, snapshot stora
 
 	seeds := make([]SeedSet, 0, len(terms))
 	for _, term := range terms {
-		matches, err := lookup.LookupNodes(ctx, snapshot, storage.NodeLookupRequest{Text: term, Limit: maxSeedsPerTerm})
+		matches, err := lookupTermMatches(ctx, lookup, snapshot, term, maxSeedsPerTerm)
 		if err != nil {
 			return nil, fmt.Errorf("rank published graph: %w", err)
 		}
@@ -67,7 +67,7 @@ func ExplainSnapshot(ctx context.Context, lookup storage.NodeLookup, explainer s
 	if lookup == nil {
 		return ExplainResult{}, fmt.Errorf("explain published graph: node lookup is required")
 	}
-	matches, err := lookup.LookupNodes(ctx, snapshot, storage.NodeLookupRequest{Text: term, Limit: maxSeedsPerTerm + 1})
+	matches, err := lookupTermMatches(ctx, lookup, snapshot, term, maxSeedsPerTerm+1)
 	if err != nil {
 		return ExplainResult{}, fmt.Errorf("explain published graph: %w", err)
 	}
@@ -86,6 +86,19 @@ func ExplainSnapshot(ctx context.Context, lookup storage.NodeLookup, explainer s
 		return ExplainResult{}, fmt.Errorf("explain published graph: %w", err)
 	}
 	return ExplainResult{Explanation: &explanation}, nil
+}
+
+func lookupTermMatches(ctx context.Context, lookup storage.NodeLookup, snapshot storage.Snapshot, term string, limit int) ([]storage.NodeMatch, error) {
+	if exactLookup, supported := lookup.(storage.ExactNodeLookup); supported {
+		matches, err := exactLookup.LookupExactNodes(ctx, snapshot, term)
+		if err != nil {
+			return nil, err
+		}
+		if len(matches) > 0 {
+			return matches[:min(len(matches), limit)], nil
+		}
+	}
+	return lookup.LookupNodes(ctx, snapshot, storage.NodeLookupRequest{Text: term, Limit: limit})
 }
 
 type nodeCollector struct {

@@ -71,6 +71,93 @@ func TestFindPathSnapshotReturnsDirectedShortestPath(t *testing.T) {
 	}
 }
 
+func TestFindPathSnapshotPrefersExactEndpointsOverBroadCandidates(t *testing.T) {
+	snapshot := storage.Snapshot{Workspace: "workspace", Version: 7}
+	indexFile := graph.Node{ID: "file:index", Label: "index.ts", QualifiedName: "core-auth/src/index.ts"}
+	authInfo := graph.Node{ID: "interface:auth-info", Label: "AuthInfo", QualifiedName: "core-auth/src/auth-info.ts::AuthInfo"}
+	related := graph.Node{ID: "file:related", Label: "auth-info.ts", QualifiedName: "core-login/src/auth-info.ts"}
+	edge := graph.Edge{SourceID: indexFile.ID, TargetID: authInfo.ID, Relation: "typescript:re_exports"}
+	lookup := exactNodeLookup{
+		nodeLookupFunc: nodeLookupFunc(func(_ context.Context, _ storage.Snapshot, request storage.NodeLookupRequest) ([]storage.NodeMatch, error) {
+			return []storage.NodeMatch{{Node: indexFile}, {Node: related}}, nil
+		}),
+		exact: func(_ context.Context, _ storage.Snapshot, identifier string) ([]storage.NodeMatch, error) {
+			switch identifier {
+			case "index.ts":
+				return []storage.NodeMatch{{Node: indexFile}}, nil
+			case authInfo.QualifiedName:
+				return []storage.NodeMatch{{Node: authInfo}}, nil
+			default:
+				return nil, nil
+			}
+		},
+	}
+	traverser := traverserFunc(func(_ context.Context, _ storage.Snapshot, request storage.TraversalRequest) (storage.TraversalResult, error) {
+		if got, want := request.StartNodeIDs, []string{indexFile.ID}; !reflect.DeepEqual(got, want) {
+			t.Errorf("traversal start nodes = %v, want %v", got, want)
+		}
+		return storage.TraversalResult{Facts: graph.Facts{Nodes: []graph.Node{indexFile, authInfo}, Edges: []graph.Edge{edge}}}, nil
+	})
+
+	result, err := query.FindPathSnapshot(context.Background(), lookup, traverser, snapshot, query.PathRequest{
+		Source:   "index.ts",
+		Target:   authInfo.QualifiedName,
+		MaxDepth: 1,
+		MaxNodes: 3,
+	})
+	if err != nil {
+		t.Fatalf("find path with exact endpoints: %v", err)
+	}
+	if got, want := result.NodeIDs(), []string{indexFile.ID, authInfo.ID}; !reflect.DeepEqual(got, want) {
+		t.Errorf("path node IDs = %v, want %v", got, want)
+	}
+	if got, want := result.Edges, []graph.Edge{edge}; !reflect.DeepEqual(got, want) {
+		t.Errorf("path edges = %+v, want %+v", got, want)
+	}
+}
+
+func TestFindPathSnapshotFallsBackToBroadLookupWhenExactReturnsNoMatches(t *testing.T) {
+	snapshot := storage.Snapshot{Workspace: "workspace", Version: 7}
+	main := graph.Node{ID: "function:main", Label: "main", QualifiedName: "src/main.ts::main"}
+	helper := graph.Node{ID: "function:helper", Label: "helper", QualifiedName: "src/helper.ts::helper"}
+	edge := graph.Edge{SourceID: main.ID, TargetID: helper.ID, Relation: "calls"}
+	broadLookups := 0
+	lookup := exactNodeLookup{
+		nodeLookupFunc: nodeLookupFunc(func(_ context.Context, _ storage.Snapshot, request storage.NodeLookupRequest) ([]storage.NodeMatch, error) {
+			broadLookups++
+			if request.Text == main.Label {
+				return []storage.NodeMatch{{Node: main}}, nil
+			}
+			return []storage.NodeMatch{{Node: helper}}, nil
+		}),
+		exact: func(context.Context, storage.Snapshot, string) ([]storage.NodeMatch, error) {
+			return nil, nil
+		},
+	}
+	traverser := traverserFunc(func(_ context.Context, _ storage.Snapshot, request storage.TraversalRequest) (storage.TraversalResult, error) {
+		if got, want := request.StartNodeIDs, []string{main.ID}; !reflect.DeepEqual(got, want) {
+			t.Errorf("traversal start nodes = %v, want %v", got, want)
+		}
+		return storage.TraversalResult{Facts: graph.Facts{Nodes: []graph.Node{main, helper}, Edges: []graph.Edge{edge}}}, nil
+	})
+
+	result, err := query.FindPathSnapshot(context.Background(), lookup, traverser, snapshot, query.PathRequest{
+		Source:   main.Label,
+		Target:   helper.Label,
+		MaxDepth: 1,
+		MaxNodes: 3,
+	})
+	if err != nil {
+		t.Fatalf("find path after exact lookup miss: %v", err)
+	}
+	if broadLookups != 2 {
+		t.Errorf("broad lookups = %d, want 2", broadLookups)
+	}
+	if got, want := result.NodeIDs(), []string{main.ID, helper.ID}; !reflect.DeepEqual(got, want) {
+		t.Errorf("path node IDs = %v, want %v", got, want)
+	}
+}
+
 func TestFindPathSnapshotReturnsCandidatesForAmbiguousEndpoint(t *testing.T) {
 	snapshot := storage.Snapshot{Workspace: "workspace", Version: 7}
 	lookup := nodeLookupFunc(func(_ context.Context, _ storage.Snapshot, request storage.NodeLookupRequest) ([]storage.NodeMatch, error) {
@@ -232,4 +319,13 @@ type traverserFunc func(context.Context, storage.Snapshot, storage.TraversalRequ
 
 func (traverser traverserFunc) Traverse(ctx context.Context, snapshot storage.Snapshot, request storage.TraversalRequest) (storage.TraversalResult, error) {
 	return traverser(ctx, snapshot, request)
+}
+
+type exactNodeLookup struct {
+	nodeLookupFunc
+	exact func(context.Context, storage.Snapshot, string) ([]storage.NodeMatch, error)
+}
+
+func (lookup exactNodeLookup) LookupExactNodes(ctx context.Context, snapshot storage.Snapshot, identifier string) ([]storage.NodeMatch, error) {
+	return lookup.exact(ctx, snapshot, identifier)
 }

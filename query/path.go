@@ -63,11 +63,11 @@ func FindPathSnapshot(ctx context.Context, lookup storage.NodeLookup, traverser 
 		return PathResult{}, fmt.Errorf("find published graph path: source, target, nonnegative maximum depth, and positive maximum nodes are required")
 	}
 
-	sources, err := lookup.LookupNodes(ctx, snapshot, storage.NodeLookupRequest{Text: request.Source, Limit: maxSeedsPerTerm + 1})
+	sources, err := pathEndpointMatches(ctx, lookup, snapshot, request.Source)
 	if err != nil {
 		return PathResult{}, fmt.Errorf("find published graph path: %w", err)
 	}
-	targets, err := lookup.LookupNodes(ctx, snapshot, storage.NodeLookupRequest{Text: request.Target, Limit: maxSeedsPerTerm + 1})
+	targets, err := pathEndpointMatches(ctx, lookup, snapshot, request.Target)
 	if err != nil {
 		return PathResult{}, fmt.Errorf("find published graph path: %w", err)
 	}
@@ -113,6 +113,19 @@ func FindPathSnapshot(ctx context.Context, lookup storage.NodeLookup, traverser 
 	result.UndirectedFallbackAttempted = true
 	result.UsedUndirectedFallback = len(result.Nodes) > 0
 	return withTraversalScopeBoundary(result, fallbackTraversal.ScopeBoundary), nil
+}
+
+func pathEndpointMatches(ctx context.Context, lookup storage.NodeLookup, snapshot storage.Snapshot, endpoint string) ([]storage.NodeMatch, error) {
+	if exactLookup, supported := lookup.(storage.ExactNodeLookup); supported {
+		matches, err := exactLookup.LookupExactNodes(ctx, snapshot, endpoint)
+		if err != nil {
+			return nil, err
+		}
+		if len(matches) > 0 {
+			return matches, nil
+		}
+	}
+	return lookup.LookupNodes(ctx, snapshot, storage.NodeLookupRequest{Text: endpoint, Limit: maxSeedsPerTerm + 1})
 }
 
 func nodeMatches(matches []storage.NodeMatch) []graph.Node {
