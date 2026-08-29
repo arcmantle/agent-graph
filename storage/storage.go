@@ -44,8 +44,9 @@ type PublishRequest struct {
 }
 
 type PublishMeasurement struct {
-	Name     string
-	Duration time.Duration
+	Name          string
+	Duration      time.Duration
+	NotApplicable bool
 }
 
 const (
@@ -80,10 +81,8 @@ type StagedPublisher interface {
 }
 
 type CommitRequest struct {
-	WorkspaceFacts              graph.Facts
-	ReplacedWorkspaceFactOwners []string
-	Measurement                 func(PublishMeasurement)
-	SQLiteWriteMeasurement      func(PublishMeasurement)
+	Measurement            func(PublishMeasurement)
+	SQLiteWriteMeasurement func(PublishMeasurement)
 }
 
 // ContributionSession accepts contribution writes and staged resolver reads before one final commit.
@@ -92,8 +91,12 @@ type ContributionSession interface {
 	ResolverProjectionPageReader
 	ResolverTargetReader
 	ResolverPackagePageReader
+	StageSource(context.Context, string) error
 	WriteContribution(context.Context, extractor.Contribution) error
+	SealContributions(context.Context) error
 	ReplaceContributionDependencies(context.Context, []extractor.Contribution) error
+	WriteWorkspaceFacts(context.Context, graph.Facts) error
+	SealWorkspaceFacts(context.Context) (FactCounts, error)
 	Commit(context.Context, CommitRequest) (Snapshot, error)
 	Rollback(context.Context) error
 }
@@ -177,6 +180,11 @@ type NodeMatch struct {
 
 type NodeLookup interface {
 	LookupNodes(context.Context, Snapshot, NodeLookupRequest) ([]NodeMatch, error)
+}
+
+// ExactNodeLookup finds nodes whose ID, qualified name, or source path exactly matches the identifier.
+type ExactNodeLookup interface {
+	LookupExactNodes(context.Context, Snapshot, string) ([]NodeMatch, error)
 }
 
 type TraversalDirection string

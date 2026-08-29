@@ -208,6 +208,40 @@ func TestPublishIncludesWorkspaceVersionFacts(t *testing.T) {
 	}
 }
 
+func TestExportDeduplicatesNodeIdentityWithWorkspaceFactPrecedence(t *testing.T) {
+	store, err := sqlite.Open(context.Background(), filepath.Join(t.TempDir(), "graph.db"))
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	contributionNode := graphNode("src/main.ts", "function:main")
+	workspaceNode := contributionNode
+	workspaceNode.Label = "resolved main"
+	snapshot, err := store.Publish(context.Background(), storage.PublishRequest{
+		Workspace:      "workspace",
+		Update:         graphUpdateWithFacts(t, "src/main.ts", graph.Facts{Nodes: []graph.Node{contributionNode}}),
+		WorkspaceFacts: graph.Facts{Nodes: []graph.Node{workspaceNode}},
+	})
+	if err != nil {
+		t.Fatalf("publish duplicate node identity: %v", err)
+	}
+
+	collector := &factCollector{}
+	if err := store.Export(context.Background(), snapshot, storage.ExportRequest{}, collector); err != nil {
+		t.Fatalf("export duplicate node identity: %v", err)
+	}
+	matching := make([]graph.Node, 0, 1)
+	for _, node := range collector.nodes {
+		if node.ID == contributionNode.ID {
+			matching = append(matching, node)
+		}
+	}
+	if len(matching) != 1 || matching[0].Label != workspaceNode.Label {
+		t.Errorf("exported duplicate identity = %+v, want one workspace node", matching)
+	}
+}
+
 func TestFactCountsReturnsVisibleUniqueFacts(t *testing.T) {
 	store, err := sqlite.Open(context.Background(), filepath.Join(t.TempDir(), "graph.db"))
 	if err != nil {
@@ -485,6 +519,11 @@ func TestResolverProjectionPageFiltersAndOrdersSnapshotProjections(t *testing.T)
 	}
 	if got := projectionPaths(page); !reflect.DeepEqual(got, []string{"src/a.ts", "src/b.ts"}) {
 		t.Errorf("first projection page paths = %q, want src/a.ts then src/b.ts", got)
+	}
+	for projectionIndex, projection := range page {
+		if len(projection.Nodes) == 0 {
+			t.Errorf("projection %d for %q has no source nodes", projectionIndex, projection.SourcePath)
+		}
 	}
 
 	page, err = store.ResolverProjectionPage(context.Background(), snapshot, storage.ResolverProjectionPageRequest{
@@ -896,7 +935,7 @@ func TestResolverProjectionCacheDropsRolledBackAndPrunedVersions(t *testing.T) {
 
 func TestResolverProjectionCacheEvictsOldestSnapshotAtBudget(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "graph.db")
-	store, err := sqlite.OpenWithOptions(context.Background(), path, sqlite.Options{MaxResolverProjectionCacheBytes: 100})
+	store, err := sqlite.OpenWithOptions(context.Background(), path, sqlite.Options{MaxResolverProjectionCacheBytes: 256})
 	if err != nil {
 		t.Fatalf("open database: %v", err)
 	}
@@ -1031,7 +1070,7 @@ func TestResolverProjectionsFollowReplacementRollbackAndPruning(t *testing.T) {
 	}
 }
 
-func TestSourceContributionsCacheReturnsDefensiveCopiesAndReopensFromSQLite(t *testing.T) {
+func TestSourceContributionsReturnDefensiveCopiesAndReopenFromSQLite(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "graph.db")
 	store, err := sqlite.Open(context.Background(), path)
 	if err != nil {
@@ -1193,6 +1232,45 @@ func TestLookupNodesRanksMatchesWithinProjectScope(t *testing.T) {
 	}
 	if len(matches) != 1 || matches[0].Node.ID != "function:exact" {
 		t.Errorf("scoped matches = %+v, want function:exact", matches)
+	}
+}
+
+func TestLookupExactNodesMatchesIDQualifiedNameAndFilePath(t *testing.T) {
+	store, err := sqlite.Open(context.Background(), filepath.Join(t.TempDir(), "graph.db"))
+	if err != nil {
+		t.Fatalf("open database: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := store.Close(); err != nil {
+			t.Errorf("close database: %v", err)
+		}
+	})
+
+	indexFile := graph.Node{ID: "file:index", Kind: "file", Label: "core-auth/src/index.ts", QualifiedName: "core-auth/src/index.ts", Evidence: evidence("core-auth/src/index.ts")}
+	authInfo := graph.Node{ID: "function:auth-info", Kind: "function", Label: "AuthInfo", QualifiedName: "core-auth/src/auth-info.ts::AuthInfo", Evidence: evidence("core-auth/src/auth-info.ts")}
+	snapshot, err := store.Publish(context.Background(), storage.PublishRequest{
+		Workspace: "workspace",
+		Update:    graphUpdateWithFacts(t, "core-auth/src/index.ts", graph.Facts{Nodes: []graph.Node{indexFile, authInfo}}),
+	})
+	if err != nil {
+		t.Fatalf("publish exact lookup fixture: %v", err)
+	}
+
+	for _, test := range []struct {
+		identifier string
+		wantID     string
+	}{
+		{identifier: indexFile.ID, wantID: indexFile.ID},
+		{identifier: authInfo.QualifiedName, wantID: authInfo.ID},
+		{identifier: indexFile.Evidence.Span.Path, wantID: indexFile.ID},
+	} {
+		matches, err := store.LookupExactNodes(context.Background(), snapshot, test.identifier)
+		if err != nil {
+			t.Fatalf("look up exact node %q: %v", test.identifier, err)
+		}
+		if len(matches) != 1 || matches[0].Node.ID != test.wantID {
+			t.Errorf("exact matches for %q = %+v, want %q", test.identifier, matches, test.wantID)
+		}
 	}
 }
 

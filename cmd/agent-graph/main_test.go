@@ -85,7 +85,9 @@ func TestBenchmarkCommandMeasuresCriticalUserPath(t *testing.T) {
 		GraphVersion int    `json:"graphVersion"`
 		PublishedAt  string `json:"publishedAt"`
 		Result       struct {
-			Measurements []struct {
+			ContributionQueueHighWater int `json:"contributionQueueHighWater"`
+			ContributionQueueCapacity  int `json:"contributionQueueCapacity"`
+			Measurements               []struct {
 				Name       string `json:"name"`
 				DurationNS int64  `json:"durationNs"`
 			} `json:"measurements"`
@@ -102,7 +104,9 @@ func TestBenchmarkCommandMeasuresCriticalUserPath(t *testing.T) {
 				DurationNS int64  `json:"durationNs"`
 			} `json:"sqliteWriteMeasurements"`
 			Runs []struct {
-				Measurements []struct {
+				ContributionQueueHighWater int `json:"contributionQueueHighWater"`
+				ContributionQueueCapacity  int `json:"contributionQueueCapacity"`
+				Measurements               []struct {
 					Name       string `json:"name"`
 					DurationNS int64  `json:"durationNs"`
 				} `json:"measurements"`
@@ -143,10 +147,10 @@ func TestBenchmarkCommandMeasuresCriticalUserPath(t *testing.T) {
 		}
 	}
 	for runIndex, run := range result.Result.Runs {
-		if len(run.PhaseMeasurements) != 7 {
-			t.Fatalf("run %d phase measurements = %+v, want seven indexing phases", runIndex, run.PhaseMeasurements)
+		if len(run.PhaseMeasurements) != 12 {
+			t.Fatalf("run %d phase measurements = %+v, want twelve indexing phases", runIndex, run.PhaseMeasurements)
 		}
-		for phaseIndex, want := range []string{"extraction", "extraction_write_overlap", "resolution", "publication_preparation", "sqlite_write", "commit", "staged_transaction"} {
+		for phaseIndex, want := range []string{"discovery", "pipeline_wall", "extraction", "extractor_busy", "writer_busy", "producer_blocked", "extraction_write_overlap", "resolution", "publication_preparation", "sqlite_write", "commit", "staged_transaction"} {
 			measurement := run.PhaseMeasurements[phaseIndex]
 			if measurement.Name != want {
 				t.Errorf("run %d phase measurement %d name = %q, want %q", runIndex, phaseIndex, measurement.Name, want)
@@ -155,10 +159,13 @@ func TestBenchmarkCommandMeasuresCriticalUserPath(t *testing.T) {
 				t.Errorf("run %d phase %q duration = %d, want non-negative", runIndex, measurement.Name, measurement.DurationNS)
 			}
 		}
-		if len(run.ResolverMeasurements) != 3 {
-			t.Fatalf("run %d resolver measurements = %+v, want three incremental resolver measurements", runIndex, run.ResolverMeasurements)
+		if run.ContributionQueueHighWater <= 0 || run.ContributionQueueHighWater > run.ContributionQueueCapacity {
+			t.Errorf("run %d queue statistics = %d/%d, want positive high-water at most capacity", runIndex, run.ContributionQueueHighWater, run.ContributionQueueCapacity)
 		}
-		for measurementIndex, want := range []string{"affected_source_selection", "contribution_restoration", "workspace_resolution"} {
+		if len(run.ResolverMeasurements) != 6 {
+			t.Fatalf("run %d resolver measurements = %+v, want six incremental phase measurements", runIndex, run.ResolverMeasurements)
+		}
+		for measurementIndex, want := range []string{"affected_source_selection", "contribution_restoration", "workspace_resolution", "publication_preparation", "sqlite_write", "commit"} {
 			measurement := run.ResolverMeasurements[measurementIndex]
 			if measurement.Name != want {
 				t.Errorf("run %d resolver measurement %d name = %q, want %q", runIndex, measurementIndex, measurement.Name, want)
@@ -168,8 +175,11 @@ func TestBenchmarkCommandMeasuresCriticalUserPath(t *testing.T) {
 			}
 		}
 	}
-	if len(result.Result.ResolverMeasurements) != 3 {
-		t.Fatalf("resolver medians = %+v, want three incremental resolver measurements", result.Result.ResolverMeasurements)
+	if len(result.Result.ResolverMeasurements) != 6 {
+		t.Fatalf("incremental phase medians = %+v, want six measurements", result.Result.ResolverMeasurements)
+	}
+	if result.Result.ContributionQueueHighWater <= 0 || result.Result.ContributionQueueHighWater > result.Result.ContributionQueueCapacity {
+		t.Errorf("queue statistics = %d/%d, want positive high-water at most capacity", result.Result.ContributionQueueHighWater, result.Result.ContributionQueueCapacity)
 	}
 	writeTables := []string{
 		"workspace_nodes",
@@ -197,8 +207,8 @@ func TestBenchmarkCommandMeasuresCriticalUserPath(t *testing.T) {
 			t.Errorf("SQLite write median %q duration = %d, want non-negative", measurement.Name, measurement.DurationNS)
 		}
 	}
-	if len(result.Result.Runs) != benchmarkRuns {
-		t.Fatalf("warm runs = %+v, want %d", result.Result.Runs, benchmarkRuns)
+	if len(result.Result.Runs) != 1 {
+		t.Fatalf("warm runs = %+v, want one", result.Result.Runs)
 	}
 	for runIndex, run := range result.Result.Runs {
 		if len(run.Measurements) != 5 || run.PeakRSSBytes == 0 || run.DatabaseBytes <= 0 || run.OutputChecksum == "" {
@@ -210,6 +220,55 @@ func TestBenchmarkCommandMeasuresCriticalUserPath(t *testing.T) {
 	}
 	if progress := standardError.String(); !strings.Contains(progress, "Benchmark setup: generated 3/3 source files") || !strings.Contains(progress, "Benchmark setup: validation extract 3/3 sources") || !strings.Contains(progress, "Benchmark setup: validation resolve 3/3 sources") || !strings.Contains(progress, "Benchmark setup: validation publish 3/3 sources") || !strings.Contains(progress, "Benchmark setup: validated 16/16 nodes and 30/30 edges") || !strings.Contains(progress, "Benchmark run 1/1: complete") {
 		t.Errorf("benchmark progress = %q, want setup counts and run completion messages", progress)
+	}
+}
+
+func TestBenchmarkCommandRunsExplicitExactScaleAcceptance(t *testing.T) {
+	output := &strings.Builder{}
+	standardError := &strings.Builder{}
+	if exitCode := run([]string{"benchmark", "--format", "json", "--exact-scale", "--source-files", "4", "--runs", "3"}, output, standardError); exitCode != 0 {
+		t.Fatalf("run exact-scale benchmark command: exit code %d, error %s", exitCode, standardError.String())
+	}
+
+	var result struct {
+		Result struct {
+			Configuration struct {
+				ExtractionWorkers         int `json:"extractionWorkers"`
+				SourceQueueCapacity       int `json:"sourceQueueCapacity"`
+				ContributionQueueCapacity int `json:"contributionQueueCapacity"`
+				ContributionBatchRows     int `json:"contributionBatchRows"`
+				ContributionBatchBytes    int `json:"contributionBatchBytes"`
+				ContributionBatchSources  int `json:"contributionBatchSources"`
+				ResolverPageSize          int `json:"resolverPageSize"`
+				WorkspaceFactBatchRows    int `json:"workspaceFactBatchRows"`
+				WorkspaceFactBatchBytes   int `json:"workspaceFactBatchBytes"`
+			} `json:"configuration"`
+			Runs []struct {
+				SourceFiles    int    `json:"sourceFiles"`
+				NodeCount      int    `json:"nodeCount"`
+				EdgeCount      int    `json:"edgeCount"`
+				OutputChecksum string `json:"outputChecksum"`
+			} `json:"runs"`
+		} `json:"result"`
+	}
+	if err := json.Unmarshal([]byte(output.String()), &result); err != nil {
+		t.Fatalf("decode exact-scale benchmark result: %v\n%s", err, output.String())
+	}
+	if len(result.Result.Runs) != 3 {
+		t.Fatalf("exact-scale runs = %d, want 3", len(result.Result.Runs))
+	}
+	configuration := result.Result.Configuration
+	if configuration.ExtractionWorkers <= 0 || configuration.SourceQueueCapacity <= 0 || configuration.ContributionQueueCapacity <= 0 || configuration.ContributionBatchRows <= 0 || configuration.ContributionBatchBytes <= 0 || configuration.ContributionBatchSources <= 0 || configuration.ResolverPageSize <= 0 || configuration.WorkspaceFactBatchRows <= 0 || configuration.WorkspaceFactBatchBytes <= 0 {
+		t.Errorf("exact-scale configuration = %+v, want all positive memory bounds", configuration)
+	}
+	checksum := result.Result.Runs[0].OutputChecksum
+	for runIndex, benchmarkRun := range result.Result.Runs {
+		if benchmarkRun.SourceFiles != 4 || benchmarkRun.NodeCount != 400 || benchmarkRun.EdgeCount != 800 {
+			t.Errorf("run %d counts = %d sources, %d nodes and %d edges, want 4, 400 and 800", runIndex, benchmarkRun.SourceFiles, benchmarkRun.NodeCount, benchmarkRun.EdgeCount)
+		}
+		if checksum == "" || benchmarkRun.OutputChecksum != checksum {
+			t.Errorf("run %d checksum = %q, want stable nonempty %q", runIndex, benchmarkRun.OutputChecksum, checksum)
+		}
 	}
 }
 
@@ -228,6 +287,24 @@ func TestBenchmarkCommandWritesInitialIndexCPUProfile(t *testing.T) {
 	}
 	if profile.Size() == 0 {
 		t.Error("CPU profile is empty")
+	}
+}
+
+func TestBenchmarkCommandWritesIncrementalUpdateCPUProfile(t *testing.T) {
+	profilePath := filepath.Join(t.TempDir(), "incremental-update.pprof")
+	output := &strings.Builder{}
+	standardError := &strings.Builder{}
+
+	if exitCode := run([]string{"benchmark", "--source-files", "3", "--functions-per-file", "4", "--incremental-cpu-profile", profilePath}, output, standardError); exitCode != 0 {
+		t.Fatalf("run benchmark with incremental CPU profile: exit code %d, error %s", exitCode, standardError.String())
+	}
+
+	profile, err := os.Stat(profilePath)
+	if err != nil {
+		t.Fatalf("stat incremental CPU profile: %v", err)
+	}
+	if profile.Size() == 0 {
+		t.Error("incremental CPU profile is empty")
 	}
 }
 
@@ -261,8 +338,8 @@ func TestBenchmarkCommandMeasuresGoWorkspace(t *testing.T) {
 	if err := json.Unmarshal([]byte(output.String()), &result); err != nil {
 		t.Fatalf("decode Go workspace benchmark result: %v\n%s", err, output.String())
 	}
-	if len(result.Result.Runs) != benchmarkRuns {
-		t.Errorf("benchmark runs = %+v, want %d workspace measurements", result.Result.Runs, benchmarkRuns)
+	if len(result.Result.Runs) != 1 {
+		t.Errorf("benchmark runs = %+v, want one workspace measurement", result.Result.Runs)
 	}
 	for runIndex, run := range result.Result.Runs {
 		if run.OutputChecksum == "" {

@@ -78,6 +78,98 @@ func TestValidateUsesOneHundredSecondInitialIndexLimitForTenThousandFileCorpusAn
 	}
 }
 
+func TestValidateReportRejectsExactScalePeakRSSAboveApprovedCeiling(t *testing.T) {
+	runs := []benchmark.Run{
+		completeRun(90*time.Second, 1),
+		completeRun(91*time.Second, 1),
+		completeRun(92*time.Second, ^uint64(0)),
+	}
+	for index := range runs {
+		runs[index].SourceFiles = 10000
+		runs[index].NodeCount = 1000000
+		runs[index].EdgeCount = 2000000
+	}
+
+	err := benchmark.ValidateExactScaleReport(runs, 10000)
+	if err == nil {
+		t.Fatal("validate exact-scale report above peak RSS ceiling succeeded")
+	}
+	if !strings.Contains(err.Error(), "peak RSS") || !strings.Contains(err.Error(), "approved ceiling") {
+		t.Errorf("validate report error = %q, want approved peak RSS ceiling", err)
+	}
+}
+
+func TestValidateReportRejectsExactScaleRunWithWrongCounts(t *testing.T) {
+	runs := []benchmark.Run{
+		completeRun(90*time.Second, 1),
+		completeRun(91*time.Second, 1),
+		completeRun(92*time.Second, 1),
+	}
+	for index := range runs {
+		runs[index].SourceFiles = 10000
+		runs[index].NodeCount = 1000000
+		runs[index].EdgeCount = 2000000
+	}
+	runs[1].EdgeCount--
+
+	err := benchmark.ValidateExactScaleReport(runs, 10000)
+	if err == nil {
+		t.Fatal("validate exact-scale report with wrong edge count succeeded")
+	}
+	if !strings.Contains(err.Error(), "1000000 nodes and 1999999 edges") || !strings.Contains(err.Error(), "1000000 nodes and 2000000 edges") {
+		t.Errorf("validate report error = %q, want exact node and edge counts", err)
+	}
+}
+
+func TestValidateScaleShapeRejectsRetainedHeapThatTracksCorpusGrowth(t *testing.T) {
+	smaller := []benchmark.Run{
+		{SourceFiles: 1000, RetainedHeapBytes: 100 << 20},
+		{SourceFiles: 1000, RetainedHeapBytes: 101 << 20},
+		{SourceFiles: 1000, RetainedHeapBytes: 102 << 20},
+	}
+	larger := []benchmark.Run{
+		{SourceFiles: 10000, RetainedHeapBytes: 900 << 20},
+		{SourceFiles: 10000, RetainedHeapBytes: 910 << 20},
+		{SourceFiles: 10000, RetainedHeapBytes: 920 << 20},
+	}
+
+	err := benchmark.ValidateScaleShape(smaller, larger)
+	if err == nil {
+		t.Fatal("validate corpus-proportional retained heap succeeded")
+	}
+	if !strings.Contains(err.Error(), "retained heap") || !strings.Contains(err.Error(), "corpus growth") {
+		t.Errorf("validate scale shape error = %q, want retained heap and corpus growth", err)
+	}
+}
+
+func TestExactScaleRSSCalibrationRecordsThreeHostRuns(t *testing.T) {
+	calibration := benchmark.ExactScaleRSSCalibration()
+	if calibration.SourceFiles != 10000 || calibration.Host == "" || calibration.GoVersion == "" || calibration.Commit == "" || calibration.BinarySHA256 == "" {
+		t.Errorf("RSS calibration = %+v, want corpus, host, Go, and commit details", calibration)
+	}
+	if len(calibration.RawPeakRSSBytes) != 3 || calibration.BaselineMedian == 0 || calibration.ApprovedCeiling < calibration.BaselineMedian {
+		t.Errorf("RSS calibration = %+v, want three raw runs and a valid median and ceiling", calibration)
+	}
+}
+
+func TestValidateExactScaleReportAcceptsRecordedCalibration(t *testing.T) {
+	calibration := benchmark.ExactScaleRSSCalibration()
+	runs := []benchmark.Run{
+		completeRun(80*time.Second, calibration.RawPeakRSSBytes[0]),
+		completeRun(84*time.Second, calibration.RawPeakRSSBytes[1]),
+		completeRun(94*time.Second, calibration.RawPeakRSSBytes[2]),
+	}
+	for index := range runs {
+		runs[index].SourceFiles = 10000
+		runs[index].NodeCount = 1000000
+		runs[index].EdgeCount = 2000000
+	}
+
+	if err := benchmark.ValidateExactScaleReport(runs, 10000); err != nil {
+		t.Fatalf("validate recorded exact-scale calibration: %v", err)
+	}
+}
+
 func TestValidateReportRejectsMissingRunMetadata(t *testing.T) {
 	runs := []benchmark.Run{
 		{Measurements: measurements(time.Second, time.Second, time.Millisecond, time.Millisecond, time.Millisecond), PhaseMeasurements: phaseMeasurements(), ResolverMeasurements: resolverMeasurements(), SQLiteWriteMeasurements: sqliteWriteMeasurements()},
@@ -108,12 +200,15 @@ func TestValidateReportRejectsDifferentChecksums(t *testing.T) {
 
 func TestValidateReportRejectsIncompletePhaseMeasurements(t *testing.T) {
 	runs := []benchmark.Run{{
-		Measurements:            measurements(time.Second, time.Second, time.Millisecond, time.Millisecond, time.Millisecond),
-		ResolverMeasurements:    resolverMeasurements(),
-		SQLiteWriteMeasurements: sqliteWriteMeasurements(),
-		PeakRSSBytes:            1,
-		DatabaseBytes:           1,
-		OutputChecksum:          "sha256:stable",
+		Measurements:               measurements(time.Second, time.Second, time.Millisecond, time.Millisecond, time.Millisecond),
+		ResolverMeasurements:       resolverMeasurements(),
+		SQLiteWriteMeasurements:    sqliteWriteMeasurements(),
+		ContributionQueueHighWater: 1,
+		ContributionQueueCapacity:  1,
+		PeakRSSBytes:               1,
+		RetainedHeapBytes:          1,
+		DatabaseBytes:              1,
+		OutputChecksum:             "sha256:stable",
 	}}
 
 	err := benchmark.ValidateReport(runs, 42)
@@ -141,13 +236,15 @@ func TestValidateReportRejectsInvalidResolverMeasurements(t *testing.T) {
 	for _, testCase := range testCases {
 		t.Run(testCase.name, func(t *testing.T) {
 			runs := []benchmark.Run{{
-				Measurements:            measurements(time.Second, time.Second, time.Millisecond, time.Millisecond, time.Millisecond),
-				PhaseMeasurements:       phaseMeasurements(),
-				ResolverMeasurements:    testCase.measurements,
-				SQLiteWriteMeasurements: sqliteWriteMeasurements(),
-				PeakRSSBytes:            1,
-				DatabaseBytes:           1,
-				OutputChecksum:          "sha256:stable",
+				Measurements:               measurements(time.Second, time.Second, time.Millisecond, time.Millisecond, time.Millisecond),
+				PhaseMeasurements:          phaseMeasurements(),
+				ResolverMeasurements:       testCase.measurements,
+				SQLiteWriteMeasurements:    sqliteWriteMeasurements(),
+				ContributionQueueHighWater: 1,
+				ContributionQueueCapacity:  1,
+				PeakRSSBytes:               1,
+				DatabaseBytes:              1,
+				OutputChecksum:             "sha256:stable",
 			}}
 
 			err := benchmark.ValidateReport(runs, 42)
@@ -158,6 +255,49 @@ func TestValidateReportRejectsInvalidResolverMeasurements(t *testing.T) {
 				t.Errorf("validate report error = %q, want resolver measurement error", err)
 			}
 		})
+	}
+}
+
+func TestOrderSQLiteWriteMeasurementsRejectsMissingRequiredMeasurement(t *testing.T) {
+	measurements := sqliteWriteMeasurements()
+	measurements = measurements[:len(measurements)-1]
+
+	_, err := benchmark.OrderSQLiteWriteMeasurements(measurements)
+	if err == nil {
+		t.Fatal("order incomplete SQLite write measurements succeeded")
+	}
+	if !strings.Contains(err.Error(), "contribution_symbol_references") {
+		t.Errorf("order SQLite write measurements error = %q, want missing measurement name", err)
+	}
+}
+
+func TestValidateReportRejectsZeroDurationForApplicableSQLiteWrite(t *testing.T) {
+	sqliteMeasurements := sqliteWriteMeasurements()
+	sqliteMeasurements[0].Duration = 0
+	runs := []benchmark.Run{{
+		Measurements:               measurements(time.Second, time.Second, time.Millisecond, time.Millisecond, time.Millisecond),
+		PhaseMeasurements:          phaseMeasurements(),
+		ResolverMeasurements:       resolverMeasurements(),
+		SQLiteWriteMeasurements:    sqliteMeasurements,
+		ContributionQueueHighWater: 1,
+		ContributionQueueCapacity:  1,
+		PeakRSSBytes:               1,
+		RetainedHeapBytes:          1,
+		DatabaseBytes:              1,
+		OutputChecksum:             "sha256:stable",
+	}}
+
+	err := benchmark.ValidateReport(runs, 42)
+	if err == nil {
+		t.Fatal("validate report with zero-duration SQLite write succeeded")
+	}
+	if !strings.Contains(err.Error(), "workspace_nodes") {
+		t.Errorf("validate report error = %q, want zero-duration measurement name", err)
+	}
+
+	runs[0].SQLiteWriteMeasurements[0].NotApplicable = true
+	if err := benchmark.ValidateReport(runs, 42); err != nil {
+		t.Fatalf("validate report with not-applicable SQLite write: %v", err)
 	}
 }
 
@@ -391,7 +531,12 @@ func measurements(initialIndex, incrementalUpdate, query, path, explain time.Dur
 
 func phaseMeasurements() []benchmark.Measurement {
 	return []benchmark.Measurement{
+		{Name: "discovery", Duration: time.Millisecond},
+		{Name: "pipeline_wall", Duration: time.Millisecond},
 		{Name: "extraction", Duration: time.Millisecond},
+		{Name: "extractor_busy", Duration: time.Millisecond},
+		{Name: "writer_busy", Duration: time.Millisecond},
+		{Name: "producer_blocked", Duration: time.Millisecond},
 		{Name: "extraction_write_overlap", Duration: time.Millisecond},
 		{Name: "resolution", Duration: time.Millisecond},
 		{Name: "publication_preparation", Duration: time.Millisecond},
@@ -406,6 +551,9 @@ func resolverMeasurements() []benchmark.Measurement {
 		{Name: "affected_source_selection", Duration: time.Millisecond},
 		{Name: "contribution_restoration", Duration: time.Millisecond},
 		{Name: "workspace_resolution", Duration: time.Millisecond},
+		{Name: "publication_preparation", Duration: time.Millisecond},
+		{Name: "sqlite_write", Duration: time.Millisecond},
+		{Name: "commit", Duration: time.Millisecond},
 	}
 }
 
@@ -423,5 +571,20 @@ func sqliteWriteMeasurements() []benchmark.Measurement {
 		{Name: "contribution_unresolved_references", Duration: time.Millisecond},
 		{Name: "contribution_module_bindings", Duration: time.Millisecond},
 		{Name: "contribution_symbol_references", Duration: time.Millisecond},
+	}
+}
+
+func completeRun(initialIndex time.Duration, peakRSSBytes uint64) benchmark.Run {
+	return benchmark.Run{
+		Measurements:               measurements(initialIndex, time.Second, time.Millisecond, time.Millisecond, time.Millisecond),
+		PhaseMeasurements:          phaseMeasurements(),
+		ResolverMeasurements:       resolverMeasurements(),
+		SQLiteWriteMeasurements:    sqliteWriteMeasurements(),
+		ContributionQueueHighWater: 1,
+		ContributionQueueCapacity:  1,
+		PeakRSSBytes:               peakRSSBytes,
+		RetainedHeapBytes:          1,
+		DatabaseBytes:              1,
+		OutputChecksum:             "sha256:stable",
 	}
 }

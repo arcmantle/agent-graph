@@ -14,6 +14,7 @@ import (
 	"runtime"
 	"runtime/pprof"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"syscall"
@@ -126,8 +127,13 @@ func benchmarkFlags(command *cobra.Command) {
 	formatFlag(command)
 	command.Flags().Int("source-files", benchmark.DefaultCorpusSpec.SourceFiles, "generated source file count")
 	command.Flags().Int("functions-per-file", benchmark.DefaultCorpusSpec.FunctionsPerFile, "generated minimum function count per source file")
+	command.Flags().Bool("exact-scale", false, "generate the exact-scale acceptance corpus")
+	command.Flags().Int("runs", 1, "number of benchmark runs")
 	command.Flags().Bool("realistic", false, "generate a realistic-density corpus (bounded imports, mixed declaration kinds) instead of the dense linear-chain corpus; ignores --functions-per-file")
 	command.Flags().String("cpu-profile", "", "write an initial-index CPU profile to this file")
+	command.Flags().String("incremental-cpu-profile", "", "write an incremental-update CPU profile to this file")
+	command.Flags().Bool("internal-sample", false, "run one unvalidated benchmark sample")
+	_ = command.Flags().MarkHidden("internal-sample")
 }
 
 func databaseAndFormatFlags(command *cobra.Command) {
@@ -169,32 +175,55 @@ func commandDatabasePath(command *cobra.Command, workspace string) (string, erro
 }
 
 type benchmarkMeasurement struct {
-	Name       string `json:"name"`
-	DurationNS int64  `json:"durationNs"`
+	Name          string `json:"name"`
+	DurationNS    int64  `json:"durationNs"`
+	NotApplicable bool   `json:"notApplicable,omitempty"`
 }
 
 type benchmarkRunResult struct {
-	Measurements            []benchmarkMeasurement `json:"measurements"`
-	PhaseMeasurements       []benchmarkMeasurement `json:"phaseMeasurements"`
-	ResolverMeasurements    []benchmarkMeasurement `json:"resolverMeasurements"`
-	SQLiteWriteMeasurements []benchmarkMeasurement `json:"sqliteWriteMeasurements"`
-	PeakRSSBytes            uint64                 `json:"peakRssBytes"`
-	DatabaseBytes           int64                  `json:"databaseBytes"`
-	OutputChecksum          string                 `json:"outputChecksum"`
+	Measurements               []benchmarkMeasurement `json:"measurements"`
+	PhaseMeasurements          []benchmarkMeasurement `json:"phaseMeasurements"`
+	ResolverMeasurements       []benchmarkMeasurement `json:"resolverMeasurements"`
+	SQLiteWriteMeasurements    []benchmarkMeasurement `json:"sqliteWriteMeasurements"`
+	SourceFiles                int                    `json:"sourceFiles"`
+	NodeCount                  int                    `json:"nodeCount"`
+	EdgeCount                  int                    `json:"edgeCount"`
+	ContributionQueueHighWater int                    `json:"contributionQueueHighWater"`
+	ContributionQueueCapacity  int                    `json:"contributionQueueCapacity"`
+	PeakRSSBytes               uint64                 `json:"peakRssBytes"`
+	RetainedHeapBytes          uint64                 `json:"retainedHeapBytes"`
+	DatabaseBytes              int64                  `json:"databaseBytes"`
+	OutputChecksum             string                 `json:"outputChecksum"`
 }
 
 type benchmarkResult struct {
-	Measurements            []benchmarkMeasurement `json:"measurements"`
-	PhaseMeasurements       []benchmarkMeasurement `json:"phaseMeasurements"`
-	ResolverMeasurements    []benchmarkMeasurement `json:"resolverMeasurements"`
-	SQLiteWriteMeasurements []benchmarkMeasurement `json:"sqliteWriteMeasurements"`
-	Runs                    []benchmarkRunResult   `json:"runs"`
-	PeakRSSBytes            uint64                 `json:"peakRssBytes"`
-	DatabaseBytes           int64                  `json:"databaseBytes"`
-	OutputChecksum          string                 `json:"outputChecksum"`
+	Configuration              benchmarkConfiguration    `json:"configuration"`
+	RSSCalibration             *benchmark.RSSCalibration `json:"rssCalibration,omitempty"`
+	ScaleShape                 *benchmark.ScaleShape     `json:"scaleShape,omitempty"`
+	Measurements               []benchmarkMeasurement    `json:"measurements"`
+	PhaseMeasurements          []benchmarkMeasurement    `json:"phaseMeasurements"`
+	ResolverMeasurements       []benchmarkMeasurement    `json:"resolverMeasurements"`
+	SQLiteWriteMeasurements    []benchmarkMeasurement    `json:"sqliteWriteMeasurements"`
+	ContributionQueueHighWater int                       `json:"contributionQueueHighWater"`
+	ContributionQueueCapacity  int                       `json:"contributionQueueCapacity"`
+	Runs                       []benchmarkRunResult      `json:"runs"`
+	PeakRSSBytes               uint64                    `json:"peakRssBytes"`
+	RetainedHeapBytes          uint64                    `json:"retainedHeapBytes"`
+	DatabaseBytes              int64                     `json:"databaseBytes"`
+	OutputChecksum             string                    `json:"outputChecksum"`
 }
 
-const benchmarkRuns = 1
+type benchmarkConfiguration struct {
+	ExtractionWorkers         int `json:"extractionWorkers"`
+	SourceQueueCapacity       int `json:"sourceQueueCapacity"`
+	ContributionQueueCapacity int `json:"contributionQueueCapacity"`
+	ContributionBatchRows     int `json:"contributionBatchRows"`
+	ContributionBatchBytes    int `json:"contributionBatchBytes"`
+	ContributionBatchSources  int `json:"contributionBatchSources"`
+	ResolverPageSize          int `json:"resolverPageSize"`
+	WorkspaceFactBatchRows    int `json:"workspaceFactBatchRows"`
+	WorkspaceFactBatchBytes   int `json:"workspaceFactBatchBytes"`
+}
 
 const benchmarkProgressInterval = 5 * time.Second
 
@@ -203,6 +232,7 @@ const benchmarkValidationProgressInterval = 100000
 type benchmarkProgressReporter struct {
 	writer     io.Writer
 	runNumber  int
+	totalRuns  int
 	startedAt  time.Time
 	completed  int
 	phase      string
@@ -295,10 +325,11 @@ func (reporter *benchmarkSetupReporter) finish() {
 	<-reporter.done
 }
 
-func newBenchmarkProgressReporter(writer io.Writer, runNumber int, completed int) *benchmarkProgressReporter {
+func newBenchmarkProgressReporter(writer io.Writer, runNumber, totalRuns, completed int) *benchmarkProgressReporter {
 	return &benchmarkProgressReporter{
 		writer:    writer,
 		runNumber: runNumber,
+		totalRuns: totalRuns,
 		startedAt: time.Now(),
 		completed: completed,
 	}
@@ -306,7 +337,7 @@ func newBenchmarkProgressReporter(writer io.Writer, runNumber int, completed int
 
 func (reporter *benchmarkProgressReporter) start(phase string) {
 	reporter.phase = phase
-	fmt.Fprintf(reporter.writer, "Benchmark run %d/%d: %s\n", reporter.runNumber, benchmarkRuns, phase)
+	fmt.Fprintf(reporter.writer, "Benchmark run %d/%d: %s\n", reporter.runNumber, reporter.totalRuns, phase)
 	reporter.stopTicker = make(chan struct{})
 	reporter.done = make(chan struct{})
 	go func() {
@@ -335,12 +366,12 @@ func (reporter *benchmarkProgressReporter) finishPhase() {
 
 func (reporter *benchmarkProgressReporter) complete() {
 	reporter.finishPhase()
-	fmt.Fprintf(reporter.writer, "Benchmark run %d/%d: complete (%s elapsed)\n", reporter.runNumber, benchmarkRuns, time.Since(reporter.startedAt).Round(time.Second))
+	fmt.Fprintf(reporter.writer, "Benchmark run %d/%d: complete (%s elapsed)\n", reporter.runNumber, reporter.totalRuns, time.Since(reporter.startedAt).Round(time.Second))
 }
 
 func (reporter *benchmarkProgressReporter) reportHeartbeat() {
 	elapsed := time.Since(reporter.startedAt).Round(time.Second)
-	message := fmt.Sprintf("Benchmark run %d/%d: %s (%s elapsed", reporter.runNumber, benchmarkRuns, reporter.phase, elapsed)
+	message := fmt.Sprintf("Benchmark run %d/%d: %s (%s elapsed", reporter.runNumber, reporter.totalRuns, reporter.phase, elapsed)
 	if reporter.completed > 0 {
 		estimatedTotal := time.Duration(reporter.completed+1) * elapsed / time.Duration(reporter.completed)
 		remaining := estimatedTotal - elapsed
@@ -361,9 +392,34 @@ func runBenchmark(command *cobra.Command, arguments []string, standardOutput, st
 	if err != nil {
 		return writeCommandError(standardError, err)
 	}
+	incrementalCPUProfilePath, err := command.Flags().GetString("incremental-cpu-profile")
+	if err != nil {
+		return writeCommandError(standardError, err)
+	}
 	realistic, err := command.Flags().GetBool("realistic")
 	if err != nil {
 		return writeCommandError(standardError, err)
+	}
+	exactScale, err := command.Flags().GetBool("exact-scale")
+	if err != nil {
+		return writeCommandError(standardError, err)
+	}
+	runCount, err := command.Flags().GetInt("runs")
+	if err != nil {
+		return writeCommandError(standardError, err)
+	}
+	if runCount <= 0 {
+		return writeCommandError(standardError, cli.NewInvalidArgumentError("benchmark run count must be positive"))
+	}
+	internalSample, err := command.Flags().GetBool("internal-sample")
+	if err != nil {
+		return writeCommandError(standardError, err)
+	}
+	if exactScale && realistic {
+		return writeCommandError(standardError, cli.NewInvalidArgumentError("benchmark exact-scale and realistic modes cannot be combined"))
+	}
+	if exactScale && len(arguments) != 0 {
+		return writeCommandError(standardError, cli.NewInvalidArgumentError("benchmark exact-scale mode does not accept a workspace"))
 	}
 	var benchmarkWorkspace string
 	var corpus benchmark.Corpus
@@ -410,18 +466,29 @@ func runBenchmark(command *cobra.Command, arguments []string, standardOutput, st
 		}
 	}()
 
-	runs := make([]benchmark.Run, 0, benchmarkRuns)
+	runs := make([]benchmark.Run, 0, runCount)
 	var snapshot storage.Snapshot
-	for runNumber := 0; runNumber < benchmarkRuns; runNumber++ {
+	for runNumber := 0; runNumber < runCount; runNumber++ {
+		if exactScale {
+			run, runSnapshot, err := measureIsolatedBenchmarkRun(corpus.SourceFiles, standardError)
+			if err != nil {
+				return writeCommandError(standardError, err)
+			}
+			runs = append(runs, run)
+			snapshot = runSnapshot
+			continue
+		}
 		if err := os.WriteFile(updateSource, baselineContents, 0o644); err != nil {
 			return writeCommandError(standardError, fmt.Errorf("restore benchmark source baseline: %w", err))
 		}
-		reporter := newBenchmarkProgressReporter(standardError, runNumber+1, len(runs))
+		reporter := newBenchmarkProgressReporter(standardError, runNumber+1, runCount, len(runs))
 		profilePath := ""
+		incrementalProfilePath := ""
 		if runNumber == 0 {
 			profilePath = cpuProfilePath
+			incrementalProfilePath = incrementalCPUProfilePath
 		}
-		run, runSnapshot, err := measureBenchmarkRun(benchmarkWorkspace, stateDirectory, corpus, reporter, profilePath)
+		run, runSnapshot, err := measureBenchmarkRun(benchmarkWorkspace, stateDirectory, corpus, reporter, profilePath, incrementalProfilePath)
 		if err != nil {
 			reporter.finishPhase()
 			return writeCommandError(standardError, err)
@@ -436,22 +503,163 @@ func runBenchmark(command *cobra.Command, arguments []string, standardOutput, st
 		measurements = append(measurements, benchmarkMeasurement{Name: measurement.Name, DurationNS: measurement.Duration.Nanoseconds()})
 	}
 	data := benchmarkResult{
-		Measurements:            measurements,
-		PhaseMeasurements:       benchmarkMeasurements(benchmark.PhaseMedians(runs)),
-		ResolverMeasurements:    benchmarkMeasurements(benchmark.ResolverMedians(runs)),
-		SQLiteWriteMeasurements: benchmarkMeasurements(benchmark.SQLiteWriteMedians(runs)),
-		Runs:                    benchmarkRunResults(runs),
-		PeakRSSBytes:            maxPeakRSS(runs),
-		DatabaseBytes:           maxDatabaseBytes(runs),
-		OutputChecksum:          runs[len(runs)-1].OutputChecksum,
+		Configuration:              benchmarkConfigurationFromRuns(runs),
+		Measurements:               measurements,
+		PhaseMeasurements:          benchmarkMeasurements(benchmark.PhaseMedians(runs)),
+		ResolverMeasurements:       benchmarkMeasurements(benchmark.ResolverMedians(runs)),
+		SQLiteWriteMeasurements:    benchmarkMeasurements(benchmark.SQLiteWriteMedians(runs)),
+		ContributionQueueHighWater: maxContributionQueueHighWater(runs),
+		ContributionQueueCapacity:  maxContributionQueueCapacity(runs),
+		Runs:                       benchmarkRunResults(runs),
+		PeakRSSBytes:               maxPeakRSS(runs),
+		RetainedHeapBytes:          maxRetainedHeap(runs),
+		DatabaseBytes:              maxDatabaseBytes(runs),
+		OutputChecksum:             runs[len(runs)-1].OutputChecksum,
+	}
+	if exactScale && corpus.SourceFiles == benchmark.DefaultCorpusSpec.SourceFiles {
+		calibration := benchmark.ExactScaleRSSCalibration()
+		data.RSSCalibration = &calibration
+	}
+	if exactScale && corpus.SourceFiles == benchmark.DefaultCorpusSpec.SourceFiles {
+		smallerSpecification, err := benchmark.ExactScaleCorpusSpec(1000)
+		if err != nil {
+			return writeCommandError(standardError, err)
+		}
+		smallerWorkspace, smallerCorpus, err := prepareBenchmarkCorpus(smallerSpecification, standardError)
+		if err != nil {
+			return writeCommandError(standardError, err)
+		}
+		defer os.RemoveAll(smallerWorkspace)
+		smallerBaseline, err := os.ReadFile(filepath.Join(smallerWorkspace, smallerCorpus.UpdatePath))
+		if err != nil {
+			return writeCommandError(standardError, fmt.Errorf("read smaller benchmark source baseline: %w", err))
+		}
+		smallerRuns := make([]benchmark.Run, 0, runCount)
+		for runNumber := 0; runNumber < runCount; runNumber++ {
+			if err := os.WriteFile(filepath.Join(smallerWorkspace, smallerCorpus.UpdatePath), smallerBaseline, 0o644); err != nil {
+				return writeCommandError(standardError, fmt.Errorf("restore smaller benchmark source baseline: %w", err))
+			}
+			reporter := newBenchmarkProgressReporter(standardError, runNumber+1, runCount, len(smallerRuns))
+			run, _, err := measureBenchmarkRun(smallerWorkspace, stateDirectory, smallerCorpus, reporter, "", "")
+			if err != nil {
+				reporter.finishPhase()
+				return writeCommandError(standardError, fmt.Errorf("measure smaller exact-scale run: %w", err))
+			}
+			reporter.complete()
+			smallerRuns = append(smallerRuns, run)
+		}
+		if err := benchmark.ValidateReport(smallerRuns, smallerCorpus.SourceFiles); err != nil {
+			return writeCommandError(standardError, fmt.Errorf("validate smaller exact-scale report: %w", err))
+		}
+		shape, err := benchmark.MeasureScaleShape(smallerRuns, runs)
+		if err != nil {
+			return writeCommandError(standardError, err)
+		}
+		data.ScaleShape = &shape
 	}
 	if err := cli.Render(standardOutput, cli.Result{Snapshot: snapshot, Text: renderBenchmarkText(data), Data: data}, format); err != nil {
 		return writeCommandError(standardError, err)
 	}
-	if err := benchmark.ValidateReport(runs, corpus.SourceFiles); err != nil {
+	if internalSample {
+		return 0
+	}
+	if exactScale {
+		err = benchmark.ValidateExactScaleReport(runs, corpus.SourceFiles)
+	} else {
+		err = benchmark.ValidateReport(runs, corpus.SourceFiles)
+	}
+	if err != nil {
 		return writeCommandError(standardError, err)
 	}
 	return 0
+}
+
+func measureIsolatedBenchmarkRun(sourceFiles int, standardError io.Writer) (benchmark.Run, storage.Snapshot, error) {
+	executable, err := os.Executable()
+	if err != nil {
+		return benchmark.Run{}, storage.Snapshot{}, fmt.Errorf("find benchmark executable: %w", err)
+	}
+	arguments := []string{"benchmark", "--format", "json", "--source-files", strconv.Itoa(sourceFiles), "--runs", "1", "--internal-sample"}
+	var command *exec.Cmd
+	if strings.HasSuffix(executable, ".test") {
+		command = exec.Command("go", append([]string{"run", "."}, arguments...)...)
+	} else {
+		command = exec.Command(executable, arguments...)
+	}
+	var output strings.Builder
+	command.Stdout = &output
+	command.Stderr = standardError
+	if err := command.Run(); err != nil {
+		return benchmark.Run{}, storage.Snapshot{}, fmt.Errorf("run isolated benchmark: %w", err)
+	}
+	var envelope struct {
+		GraphVersion storage.GraphVersion `json:"graphVersion"`
+		PublishedAt  string               `json:"publishedAt"`
+		Result       benchmarkResult      `json:"result"`
+	}
+	if err := json.Unmarshal([]byte(output.String()), &envelope); err != nil {
+		return benchmark.Run{}, storage.Snapshot{}, fmt.Errorf("decode isolated benchmark: %w", err)
+	}
+	if len(envelope.Result.Runs) != 1 {
+		return benchmark.Run{}, storage.Snapshot{}, fmt.Errorf("isolated benchmark returned %d runs, want 1", len(envelope.Result.Runs))
+	}
+	publishedAt, err := time.Parse("2006-01-02T15:04:05Z", envelope.PublishedAt)
+	if err != nil {
+		return benchmark.Run{}, storage.Snapshot{}, fmt.Errorf("decode isolated benchmark publication time: %w", err)
+	}
+	return benchmarkRunFromResult(envelope.Result.Runs[0], envelope.Result.Configuration), storage.Snapshot{Version: envelope.GraphVersion, PublishedAt: publishedAt}, nil
+}
+
+func benchmarkRunFromResult(result benchmarkRunResult, configuration benchmarkConfiguration) benchmark.Run {
+	return benchmark.Run{
+		Measurements:               measurementsFromResults(result.Measurements),
+		PhaseMeasurements:          measurementsFromResults(result.PhaseMeasurements),
+		ResolverMeasurements:       measurementsFromResults(result.ResolverMeasurements),
+		SQLiteWriteMeasurements:    measurementsFromResults(result.SQLiteWriteMeasurements),
+		SourceFiles:                result.SourceFiles,
+		NodeCount:                  result.NodeCount,
+		EdgeCount:                  result.EdgeCount,
+		ExtractionWorkers:          configuration.ExtractionWorkers,
+		SourceQueueCapacity:        configuration.SourceQueueCapacity,
+		ContributionQueueHighWater: result.ContributionQueueHighWater,
+		ContributionQueueCapacity:  result.ContributionQueueCapacity,
+		ContributionBatchRows:      configuration.ContributionBatchRows,
+		ContributionBatchBytes:     configuration.ContributionBatchBytes,
+		ContributionBatchSources:   configuration.ContributionBatchSources,
+		ResolverPageSize:           configuration.ResolverPageSize,
+		WorkspaceFactBatchRows:     configuration.WorkspaceFactBatchRows,
+		WorkspaceFactBatchBytes:    configuration.WorkspaceFactBatchBytes,
+		PeakRSSBytes:               result.PeakRSSBytes,
+		RetainedHeapBytes:          result.RetainedHeapBytes,
+		DatabaseBytes:              result.DatabaseBytes,
+		OutputChecksum:             result.OutputChecksum,
+	}
+}
+
+func measurementsFromResults(results []benchmarkMeasurement) []benchmark.Measurement {
+	measurements := make([]benchmark.Measurement, 0, len(results))
+	for _, result := range results {
+		measurements = append(measurements, benchmark.Measurement{Name: result.Name, Duration: time.Duration(result.DurationNS), NotApplicable: result.NotApplicable})
+	}
+	return measurements
+}
+
+func benchmarkConfigurationFromRuns(runs []benchmark.Run) benchmarkConfiguration {
+	if len(runs) == 0 {
+		return benchmarkConfiguration{}
+	}
+	run := runs[0]
+	return benchmarkConfiguration{
+		ExtractionWorkers:         run.ExtractionWorkers,
+		SourceQueueCapacity:       run.SourceQueueCapacity,
+		ContributionQueueCapacity: run.ContributionQueueCapacity,
+		ContributionBatchRows:     run.ContributionBatchRows,
+		ContributionBatchBytes:    run.ContributionBatchBytes,
+		ContributionBatchSources:  run.ContributionBatchSources,
+		ResolverPageSize:          run.ResolverPageSize,
+		WorkspaceFactBatchRows:    run.WorkspaceFactBatchRows,
+		WorkspaceFactBatchBytes:   run.WorkspaceFactBatchBytes,
+	}
 }
 
 func prepareWorkspaceBenchmark(root string) (string, benchmark.Corpus, error) {
@@ -541,13 +749,19 @@ func benchmarkRunResults(runs []benchmark.Run) []benchmarkRunResult {
 			measurements = append(measurements, benchmarkMeasurement{Name: measurement.Name, DurationNS: measurement.Duration.Nanoseconds()})
 		}
 		results = append(results, benchmarkRunResult{
-			Measurements:            measurements,
-			PhaseMeasurements:       benchmarkMeasurements(run.PhaseMeasurements),
-			ResolverMeasurements:    benchmarkMeasurements(run.ResolverMeasurements),
-			SQLiteWriteMeasurements: benchmarkMeasurements(run.SQLiteWriteMeasurements),
-			PeakRSSBytes:            run.PeakRSSBytes,
-			DatabaseBytes:           run.DatabaseBytes,
-			OutputChecksum:          run.OutputChecksum,
+			Measurements:               measurements,
+			PhaseMeasurements:          benchmarkMeasurements(run.PhaseMeasurements),
+			ResolverMeasurements:       benchmarkMeasurements(run.ResolverMeasurements),
+			SQLiteWriteMeasurements:    benchmarkMeasurements(run.SQLiteWriteMeasurements),
+			SourceFiles:                run.SourceFiles,
+			NodeCount:                  run.NodeCount,
+			EdgeCount:                  run.EdgeCount,
+			ContributionQueueHighWater: run.ContributionQueueHighWater,
+			ContributionQueueCapacity:  run.ContributionQueueCapacity,
+			PeakRSSBytes:               run.PeakRSSBytes,
+			RetainedHeapBytes:          run.RetainedHeapBytes,
+			DatabaseBytes:              run.DatabaseBytes,
+			OutputChecksum:             run.OutputChecksum,
 		})
 	}
 	return results
@@ -556,7 +770,7 @@ func benchmarkRunResults(runs []benchmark.Run) []benchmarkRunResult {
 func benchmarkMeasurements(measurements []benchmark.Measurement) []benchmarkMeasurement {
 	result := make([]benchmarkMeasurement, 0, len(measurements))
 	for _, measurement := range measurements {
-		result = append(result, benchmarkMeasurement{Name: measurement.Name, DurationNS: measurement.Duration.Nanoseconds()})
+		result = append(result, benchmarkMeasurement{Name: measurement.Name, DurationNS: measurement.Duration.Nanoseconds(), NotApplicable: measurement.NotApplicable})
 	}
 	return result
 }
@@ -597,7 +811,7 @@ func benchmarkCorpusSpec(command *cobra.Command) (benchmark.CorpusSpec, error) {
 	}, nil
 }
 
-func measureBenchmarkRun(workspace, stateDirectory string, corpus benchmark.Corpus, reporter *benchmarkProgressReporter, cpuProfilePath string) (benchmark.Run, storage.Snapshot, error) {
+func measureBenchmarkRun(workspace, stateDirectory string, corpus benchmark.Corpus, reporter *benchmarkProgressReporter, cpuProfilePath, incrementalCPUProfilePath string) (benchmark.Run, storage.Snapshot, error) {
 	database := filepath.Join(stateDirectory, fmt.Sprintf("benchmark-%d.db", reporter.runNumber))
 	if err := os.Remove(database); err != nil && !os.IsNotExist(err) {
 		return benchmark.Run{}, storage.Snapshot{}, fmt.Errorf("reset benchmark database: %w", err)
@@ -625,14 +839,20 @@ func measureBenchmarkRun(workspace, stateDirectory string, corpus benchmark.Corp
 	}
 
 	var snapshot storage.Snapshot
+	var pipelineStatistics index.PipelineStatistics
+	var initialIndexPeakRSS uint64
+	var initialIndexRetainedHeap uint64
 	measureInitialIndex := func() error {
 		request := index.Request{
 			Root: workspace,
 			Measurement: func(measurement index.Measurement) {
 				phaseMeasurements = append(phaseMeasurements, benchmark.Measurement{Name: measurement.Name, Duration: measurement.Duration})
 			},
+			PipelineStatistics: func(statistics index.PipelineStatistics) {
+				pipelineStatistics = statistics
+			},
 			SQLiteWriteMeasurement: func(measurement storage.PublishMeasurement) {
-				sqliteWriteMeasurements = append(sqliteWriteMeasurements, benchmark.Measurement{Name: measurement.Name, Duration: measurement.Duration})
+				sqliteWriteMeasurements = append(sqliteWriteMeasurements, benchmark.Measurement{Name: measurement.Name, Duration: measurement.Duration, NotApplicable: measurement.NotApplicable})
 			},
 		}
 		var setupReporter *benchmarkSetupReporter
@@ -647,6 +867,7 @@ func measureBenchmarkRun(workspace, stateDirectory string, corpus benchmark.Corp
 		}
 		if err == nil {
 			snapshot = result.Snapshot
+			initialIndexPeakRSS = peakRSSBytes()
 		}
 		return err
 	}
@@ -673,12 +894,14 @@ func measureBenchmarkRun(workspace, stateDirectory string, corpus benchmark.Corp
 	if initialIndexError != nil {
 		return benchmark.Run{}, storage.Snapshot{}, fmt.Errorf("benchmark initial_index: %w", initialIndexError)
 	}
+	initialIndexRetainedHeap = retainedHeapBytes()
 	if reporter.runNumber == 1 {
-		if err := validateBenchmarkSnapshot(store, snapshot, corpus); err != nil {
+		counts, err := validateBenchmarkSnapshot(store, snapshot, corpus)
+		if err != nil {
 			return benchmark.Run{}, storage.Snapshot{}, err
 		}
 		if corpus.ExpectedNodes > 0 || corpus.ExpectedEdges > 0 {
-			fmt.Fprintf(reporter.writer, "Benchmark setup: validated %d/%d nodes and %d/%d edges\n", corpus.ExpectedNodes, corpus.ExpectedNodes, corpus.ExpectedEdges, corpus.ExpectedEdges)
+			fmt.Fprintf(reporter.writer, "Benchmark setup: validated %d/%d nodes and %d/%d edges\n", counts.Nodes, corpus.ExpectedNodes, counts.Edges, corpus.ExpectedEdges)
 		} else {
 			fmt.Fprintln(reporter.writer, "Benchmark setup: validated published workspace graph")
 		}
@@ -692,7 +915,16 @@ func measureBenchmarkRun(workspace, stateDirectory string, corpus benchmark.Corp
 		return benchmark.Run{}, storage.Snapshot{}, fmt.Errorf("update benchmark source: %w", err)
 	}
 	if err := measure("incremental_update", func() error {
-		var err error
+		profile, err := startCPUProfile(incrementalCPUProfilePath)
+		if err != nil {
+			return err
+		}
+		if profile != nil {
+			defer func() {
+				pprof.StopCPUProfile()
+				_ = profile.Close()
+			}()
+		}
 		snapshot, err = index.PublishBatch(context.Background(), store, index.BatchRequest{
 			Root:         workspace,
 			ChangedPaths: []string{corpus.UpdatePath},
@@ -732,7 +964,16 @@ func measureBenchmarkRun(workspace, stateDirectory string, corpus benchmark.Corp
 		return benchmark.Run{}, storage.Snapshot{}, fmt.Errorf("read benchmark database size: %w", err)
 	}
 	reporter.finishPhase()
-	return benchmark.Run{Measurements: measurements, PhaseMeasurements: phaseMeasurements, ResolverMeasurements: resolverMeasurements, SQLiteWriteMeasurements: benchmark.OrderSQLiteWriteMeasurements(sqliteWriteMeasurements), PeakRSSBytes: peakRSSBytes(), DatabaseBytes: databaseInfo.Size(), OutputChecksum: checksum}, snapshot, nil
+	orderedSQLiteWriteMeasurements, err := benchmark.OrderSQLiteWriteMeasurements(sqliteWriteMeasurements)
+	if err != nil {
+		return benchmark.Run{}, storage.Snapshot{}, fmt.Errorf("measure benchmark run: %w", err)
+	}
+	counts, err := store.FactCounts(context.Background(), snapshot)
+	if err != nil {
+		return benchmark.Run{}, storage.Snapshot{}, fmt.Errorf("measure benchmark run: count graph facts: %w", err)
+	}
+	memoryLimits := store.MemoryLimits()
+	return benchmark.Run{Measurements: measurements, PhaseMeasurements: phaseMeasurements, ResolverMeasurements: resolverMeasurements, SQLiteWriteMeasurements: orderedSQLiteWriteMeasurements, SourceFiles: corpus.SourceFiles, NodeCount: counts.Nodes, EdgeCount: counts.Edges, ExtractionWorkers: pipelineStatistics.ExtractionWorkers, SourceQueueCapacity: pipelineStatistics.SourceQueueCapacity, ContributionQueueHighWater: pipelineStatistics.ContributionQueueHighWater, ContributionQueueCapacity: pipelineStatistics.ContributionQueueCapacity, ContributionBatchRows: memoryLimits.ContributionBatchRows, ContributionBatchBytes: memoryLimits.ContributionBatchBytes, ContributionBatchSources: memoryLimits.ContributionBatchSources, ResolverPageSize: pipelineStatistics.ResolverPageSize, WorkspaceFactBatchRows: memoryLimits.WorkspaceFactBatchRows, WorkspaceFactBatchBytes: memoryLimits.WorkspaceFactBatchBytes, PeakRSSBytes: initialIndexPeakRSS, RetainedHeapBytes: initialIndexRetainedHeap, DatabaseBytes: databaseInfo.Size(), OutputChecksum: checksum}, snapshot, nil
 }
 
 func startCPUProfile(path string) (*os.File, error) {
@@ -750,24 +991,24 @@ func startCPUProfile(path string) (*os.File, error) {
 	return profile, nil
 }
 
-func validateBenchmarkSnapshot(store *sqlite.Store, snapshot storage.Snapshot, corpus benchmark.Corpus) error {
+func validateBenchmarkSnapshot(store *sqlite.Store, snapshot storage.Snapshot, corpus benchmark.Corpus) (storage.FactCounts, error) {
 	counts, err := store.FactCounts(context.Background(), snapshot)
 	if err != nil {
-		return fmt.Errorf("validate benchmark corpus: count graph facts: %w", err)
+		return storage.FactCounts{}, fmt.Errorf("validate benchmark corpus: count graph facts: %w", err)
 	}
 	if (corpus.ExpectedNodes > 0 && counts.Nodes != corpus.ExpectedNodes) || (corpus.ExpectedEdges > 0 && counts.Edges != corpus.ExpectedEdges) {
-		return fmt.Errorf("validate benchmark corpus: graph contains %d nodes and %d edges, want %d nodes and %d edges", counts.Nodes, counts.Edges, corpus.ExpectedNodes, corpus.ExpectedEdges)
+		return storage.FactCounts{}, fmt.Errorf("validate benchmark corpus: graph contains %d nodes and %d edges, want %d nodes and %d edges", counts.Nodes, counts.Edges, corpus.ExpectedNodes, corpus.ExpectedEdges)
 	}
 	for _, term := range []string{corpus.QueryTerm, corpus.PathSource, corpus.PathTarget, corpus.ExplainTerm} {
 		matches, err := store.LookupNodes(context.Background(), snapshot, storage.NodeLookupRequest{Text: term, Limit: 1})
 		if err != nil {
-			return fmt.Errorf("validate benchmark corpus: look up %q: %w", term, err)
+			return storage.FactCounts{}, fmt.Errorf("validate benchmark corpus: look up %q: %w", term, err)
 		}
 		if len(matches) == 0 {
-			return fmt.Errorf("validate benchmark corpus: expected graph node %q is unavailable", term)
+			return storage.FactCounts{}, fmt.Errorf("validate benchmark corpus: expected graph node %q is unavailable", term)
 		}
 	}
-	return nil
+	return counts, nil
 }
 
 type benchmarkChecksumSink struct {
@@ -803,6 +1044,13 @@ func peakRSSBytes() uint64 {
 	return uint64(usage.Maxrss) * 1024
 }
 
+func retainedHeapBytes() uint64 {
+	runtime.GC()
+	var statistics runtime.MemStats
+	runtime.ReadMemStats(&statistics)
+	return statistics.HeapAlloc
+}
+
 func maxPeakRSS(runs []benchmark.Run) uint64 {
 	var maximum uint64
 	for _, run := range runs {
@@ -811,10 +1059,34 @@ func maxPeakRSS(runs []benchmark.Run) uint64 {
 	return maximum
 }
 
+func maxRetainedHeap(runs []benchmark.Run) uint64 {
+	var maximum uint64
+	for _, run := range runs {
+		maximum = max(maximum, run.RetainedHeapBytes)
+	}
+	return maximum
+}
+
 func maxDatabaseBytes(runs []benchmark.Run) int64 {
 	var maximum int64
 	for _, run := range runs {
 		maximum = max(maximum, run.DatabaseBytes)
+	}
+	return maximum
+}
+
+func maxContributionQueueHighWater(runs []benchmark.Run) int {
+	maximum := 0
+	for _, run := range runs {
+		maximum = max(maximum, run.ContributionQueueHighWater)
+	}
+	return maximum
+}
+
+func maxContributionQueueCapacity(runs []benchmark.Run) int {
+	maximum := 0
+	for _, run := range runs {
+		maximum = max(maximum, run.ContributionQueueCapacity)
 	}
 	return maximum
 }
@@ -830,7 +1102,16 @@ func renderBenchmarkText(result benchmarkResult) string {
 	for _, measurement := range result.ResolverMeasurements {
 		lines = append(lines, fmt.Sprintf("%s: %d ns", measurement.Name, measurement.DurationNS))
 	}
+	for _, measurement := range result.SQLiteWriteMeasurements {
+		if measurement.NotApplicable {
+			lines = append(lines, measurement.Name+": not applicable")
+		} else {
+			lines = append(lines, fmt.Sprintf("%s: %d ns", measurement.Name, measurement.DurationNS))
+		}
+	}
+	lines = append(lines, fmt.Sprintf("contribution queue high-water: %d/%d", result.ContributionQueueHighWater, result.ContributionQueueCapacity))
 	lines = append(lines, fmt.Sprintf("peak RSS: %d bytes", result.PeakRSSBytes))
+	lines = append(lines, fmt.Sprintf("retained heap: %d bytes", result.RetainedHeapBytes))
 	lines = append(lines, fmt.Sprintf("database: %d bytes", result.DatabaseBytes))
 	lines = append(lines, "output checksum: "+result.OutputChecksum)
 	return strings.Join(lines, "\n")

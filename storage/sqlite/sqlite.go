@@ -28,26 +28,26 @@ const (
 	maximumBatchRows                             = 500
 	maximumPublicationWorkers                    = 4
 	publicationQueueDepth                        = 2
+	defaultContributionBatchRows                 = 5_000
+	defaultContributionBatchBytes                = 4 << 20
+	defaultContributionBatchSources              = 64
+	defaultWorkspaceFactBatchRows                = 500
+	defaultWorkspaceFactBatchBytes               = 4 << 20
 )
 
 var errSchemaMismatch = errors.New("SQLite schema mismatch")
 
 type Store struct {
-	database           *sql.DB
-	maxDatabaseBytes   int64
-	variableLimit      int
-	contributionMu     sync.RWMutex
-	contributions      map[string]cachedContributions
-	projectionMu       sync.Mutex
-	projections        map[projectionCacheKey]cachedProjections
-	projectionBytes    int64
-	projectionOrder    uint64
-	maxProjectionBytes int64
-}
-
-type cachedContributions struct {
-	version storage.GraphVersion
-	values  []storage.SourceContribution
+	database                 *sql.DB
+	maxDatabaseBytes         int64
+	variableLimit            int
+	projectionMu             sync.Mutex
+	projections              map[projectionCacheKey]cachedProjections
+	projectionBytes          int64
+	projectionOrder          uint64
+	maxProjectionBytes       int64
+	contributionBatchLimits  contributionBatchLimits
+	workspaceFactBatchLimits factBatchLimits
 }
 
 type projectionCacheKey struct {
@@ -66,6 +66,24 @@ type Options struct {
 	MaxResolverProjectionCacheBytes int64
 }
 
+type MemoryLimits struct {
+	ContributionBatchRows    int
+	ContributionBatchBytes   int
+	ContributionBatchSources int
+	WorkspaceFactBatchRows   int
+	WorkspaceFactBatchBytes  int
+}
+
+func (store *Store) MemoryLimits() MemoryLimits {
+	return MemoryLimits{
+		ContributionBatchRows:    store.contributionBatchLimits.maximumRows,
+		ContributionBatchBytes:   store.contributionBatchLimits.maximumBytes,
+		ContributionBatchSources: store.contributionBatchLimits.maximumSources,
+		WorkspaceFactBatchRows:   store.workspaceFactBatchLimits.maximumRows,
+		WorkspaceFactBatchBytes:  store.workspaceFactBatchLimits.maximumBytes,
+	}
+}
+
 var _ storage.Publisher = (*Store)(nil)
 var _ storage.ProgressPublisher = (*Store)(nil)
 var _ storage.StagedPublisher = (*Store)(nil)
@@ -79,6 +97,7 @@ var _ storage.ResolverTargetReader = (*Store)(nil)
 var _ storage.ResolverPackagePageReader = (*Store)(nil)
 var _ storage.SnapshotOpener = (*Store)(nil)
 var _ storage.NodeLookup = (*Store)(nil)
+var _ storage.ExactNodeLookup = (*Store)(nil)
 var _ storage.Traverser = (*Store)(nil)
 var _ storage.Explainer = (*Store)(nil)
 var _ storage.Exporter = (*Store)(nil)
@@ -128,9 +147,17 @@ func OpenWithOptions(ctx context.Context, path string, options Options) (*Store,
 		database:           database,
 		maxDatabaseBytes:   options.MaxDatabaseBytes,
 		variableLimit:      variableLimit,
-		contributions:      make(map[string]cachedContributions),
 		projections:        make(map[projectionCacheKey]cachedProjections),
 		maxProjectionBytes: options.MaxResolverProjectionCacheBytes,
+		contributionBatchLimits: contributionBatchLimits{
+			maximumRows:    defaultContributionBatchRows,
+			maximumBytes:   defaultContributionBatchBytes,
+			maximumSources: defaultContributionBatchSources,
+		},
+		workspaceFactBatchLimits: factBatchLimits{
+			maximumRows:  defaultWorkspaceFactBatchRows,
+			maximumBytes: defaultWorkspaceFactBatchBytes,
+		},
 	}, nil
 }
 
@@ -268,7 +295,7 @@ func (store *Store) publish(ctx context.Context, request storage.PublishRequest,
 		[][]any{{request.Workspace, version, publishedAt.Format(time.RFC3339Nano)}}); err != nil {
 		return storage.Snapshot{}, fmt.Errorf("record graph publication: %w", err)
 	}
-	if err := storePreparedPublication(ctx, transaction, store.variableLimit, request.Workspace, version, request.WorkspaceFacts, request.ReplacedWorkspaceFactOwners, request.SQLiteWriteMeasurement, contributions, reportProgress); err != nil {
+	if err := storePreparedPublication(ctx, transaction, store.variableLimit, factBatchLimits{maximumRows: maximumBatchRows}, request.Workspace, version, request.WorkspaceFacts, request.ReplacedWorkspaceFactOwners, request.SQLiteWriteMeasurement, contributions, reportProgress); err != nil {
 		return storage.Snapshot{}, err
 	}
 	if version > retainedGraphVersions {
@@ -286,7 +313,9 @@ func (store *Store) publish(ctx context.Context, request storage.PublishRequest,
 		return storage.Snapshot{}, fmt.Errorf("commit graph publication: %w", err)
 	}
 	reportPublishMeasurement(request.Measurement, storage.CommitMeasurement, time.Since(commitStarted))
-	store.cachePublishedContributions(request.Workspace, version, request.Update)
+	store.invalidateWorkspaceCaches(request.Workspace, func(cachedVersion storage.GraphVersion) bool {
+		return cachedVersion == version
+	})
 	_ = reclaimFreePages(ctx, store.database)
 	return storage.Snapshot{Workspace: request.Workspace, Version: version, PublishedAt: publishedAt}, nil
 }
@@ -303,16 +332,28 @@ func (store *Store) BeginContributionSession(ctx context.Context, workspace stri
 		return nil, fmt.Errorf("start contribution session: %w", err)
 	}
 	session := &contributionSession{
-		store:       store,
-		transaction: transaction,
-		workspace:   workspace,
-		beganAt:     beganAt,
-		batch:       newPublicationBatch(store.variableLimit, nil),
-		sourcePaths: make(map[string]struct{}),
+		store:             store,
+		transaction:       transaction,
+		workspace:         workspace,
+		beganAt:           beganAt,
+		writeMeasurements: make(map[string]time.Duration),
 	}
+	session.batch = newPublicationBatch(store.variableLimit, session.recordWriteMeasurement)
+	session.batch.limits = store.contributionBatchLimits
 	if err := transaction.QueryRowContext(ctx, "SELECT COALESCE(MAX(version), 0) + 1 FROM graph_versions WHERE workspace = ?", workspace).Scan(&session.pendingVersion); err != nil {
 		_ = transaction.Rollback()
 		return nil, fmt.Errorf("allocate contribution session graph version: %w", err)
+	}
+	if _, err := transaction.ExecContext(ctx, `
+		CREATE TEMP TABLE IF NOT EXISTS contribution_session_sources (
+			workspace TEXT NOT NULL,
+			pending_version INTEGER NOT NULL,
+			source_path TEXT NOT NULL,
+			contribution_written INTEGER NOT NULL DEFAULT 0,
+			PRIMARY KEY (workspace, pending_version, source_path)
+		)`); err != nil {
+		_ = transaction.Rollback()
+		return nil, fmt.Errorf("create contribution session source table: %w", err)
 	}
 	return session, nil
 }
@@ -322,15 +363,18 @@ func (store *Store) BeginContributionSession(ctx context.Context, workspace stri
 // write failure or an explicit rollback rolls back the whole transaction, and the new
 // version becomes visible to other readers only when Commit succeeds.
 type contributionSession struct {
-	store          *Store
-	transaction    *sql.Tx
-	workspace      string
-	beganAt        time.Time
-	pendingVersion storage.GraphVersion
-	batch          publicationBatch
-	contributions  []extractor.Contribution
-	sourcePaths    map[string]struct{}
-	closed         bool
+	store                 *Store
+	transaction           *sql.Tx
+	workspace             string
+	beganAt               time.Time
+	pendingVersion        storage.GraphVersion
+	batch                 publicationBatch
+	writeMeasurements     map[string]time.Duration
+	sealed                bool
+	missingSourcesClosed  bool
+	workspaceFactsWritten bool
+	workspaceFactsSealed  bool
+	closed                bool
 }
 
 // fail rolls back the session's transaction and marks the session closed, so it exposes no partial facts.
@@ -342,13 +386,49 @@ func (session *contributionSession) fail(err error) error {
 	return err
 }
 
+func (session *contributionSession) StageSource(ctx context.Context, sourcePath string) error {
+	if session.closed {
+		return fmt.Errorf("stage contribution source: %w: session is closed", storage.ErrInvalidRequest)
+	}
+	if session.sealed {
+		return fmt.Errorf("stage contribution source: %w: contributions are sealed", storage.ErrInvalidRequest)
+	}
+	if sourcePath == "" {
+		return session.fail(fmt.Errorf("stage contribution source: %w: source path is required", storage.ErrInvalidRequest))
+	}
+	if _, err := session.transaction.ExecContext(ctx, `
+		INSERT INTO contribution_session_sources (workspace, pending_version, source_path)
+		VALUES (?, ?, ?)`, session.workspace, session.pendingVersion, sourcePath); err != nil {
+		return session.fail(fmt.Errorf("stage contribution source %q: %w", sourcePath, err))
+	}
+	return nil
+}
+
 func (session *contributionSession) WriteContribution(ctx context.Context, contribution extractor.Contribution) error {
 	if session.closed {
 		return fmt.Errorf("write contribution: %w: session is closed", storage.ErrInvalidRequest)
 	}
+	if session.sealed {
+		return fmt.Errorf("write contribution: %w: contributions are sealed", storage.ErrInvalidRequest)
+	}
+	if err := ctx.Err(); err != nil {
+		return session.fail(fmt.Errorf("write contribution: %w", err))
+	}
 	sourcePath := contribution.SourcePath()
-	if _, exists := session.sourcePaths[sourcePath]; exists {
-		return session.fail(fmt.Errorf("write contribution: %w: duplicate source path %q", storage.ErrInvalidRequest, sourcePath))
+	result, err := session.transaction.ExecContext(ctx, `
+		UPDATE contribution_session_sources
+		SET contribution_written = 1
+		WHERE workspace = ? AND pending_version = ? AND source_path = ? AND contribution_written = 0`,
+		session.workspace, session.pendingVersion, sourcePath)
+	if err != nil {
+		return session.fail(fmt.Errorf("write contribution: mark source %q: %w", sourcePath, err))
+	}
+	written, err := result.RowsAffected()
+	if err != nil {
+		return session.fail(fmt.Errorf("write contribution: inspect source %q: %w", sourcePath, err))
+	}
+	if written != 1 {
+		return session.fail(fmt.Errorf("write contribution: %w: source path %q is not staged or already has a contribution", storage.ErrInvalidRequest, sourcePath))
 	}
 	update, err := extractor.NewGraphUpdate([]extractor.Contribution{contribution})
 	if err != nil {
@@ -365,25 +445,64 @@ func (session *contributionSession) WriteContribution(ctx context.Context, contr
 	if err := session.batch.add(ctx, session.transaction, session.workspace, session.pendingVersion, prepared); err != nil {
 		return session.fail(fmt.Errorf("write contribution: %w", err))
 	}
-	// Flush now so a write failure surfaces from this call and staged resolver reads
-	// in the same session can see the contribution before commit.
-	if err := session.batch.flush(ctx, session.transaction); err != nil {
-		return session.fail(fmt.Errorf("write contribution: %w", err))
-	}
-	session.sourcePaths[sourcePath] = struct{}{}
-	session.contributions = append(session.contributions, contribution)
 	return nil
+}
+
+func (session *contributionSession) SealContributions(ctx context.Context) error {
+	if session.closed {
+		return fmt.Errorf("seal contributions: %w: session is closed", storage.ErrInvalidRequest)
+	}
+	if session.sealed {
+		return nil
+	}
+	if err := session.batch.flush(ctx, session.transaction); err != nil {
+		return session.fail(fmt.Errorf("seal contributions: %w", err))
+	}
+	session.sealed = true
+	return nil
+}
+
+func (session *contributionSession) recordWriteMeasurement(measurement storage.PublishMeasurement) {
+	if measurement.NotApplicable {
+		return
+	}
+	session.writeMeasurements[measurement.Name] += measurement.Duration
+}
+
+func (session *contributionSession) reportWriteMeasurements(callback func(storage.PublishMeasurement)) {
+	for _, insertion := range session.batch.insertions {
+		if duration, found := session.writeMeasurements[insertion.name]; found {
+			reportPublishMeasurement(callback, insertion.name, duration)
+		} else if callback != nil {
+			callback(storage.PublishMeasurement{Name: insertion.name, NotApplicable: true})
+		}
+	}
 }
 
 func (session *contributionSession) ReplaceContributionDependencies(ctx context.Context, contributions []extractor.Contribution) error {
 	if session.closed {
 		return fmt.Errorf("replace contribution dependencies: %w: session is closed", storage.ErrInvalidRequest)
 	}
+	if !session.sealed {
+		return fmt.Errorf("replace contribution dependencies: %w: contributions are not sealed", storage.ErrInvalidRequest)
+	}
 	updated := make(map[string]extractor.Contribution, len(contributions))
 	for _, contribution := range contributions {
 		sourcePath := contribution.SourcePath()
-		if _, exists := session.sourcePaths[sourcePath]; !exists {
+		var contributionWritten int
+		err := session.transaction.QueryRowContext(ctx, `
+			SELECT contribution_written
+			FROM contribution_session_sources
+			WHERE workspace = ? AND pending_version = ? AND source_path = ?`,
+			session.workspace, session.pendingVersion, sourcePath).Scan(&contributionWritten)
+		if errors.Is(err, sql.ErrNoRows) {
 			return session.fail(fmt.Errorf("replace contribution dependencies: %w: source path %q is not staged", storage.ErrInvalidRequest, sourcePath))
+		}
+		if err != nil {
+			return session.fail(fmt.Errorf("replace contribution dependencies: read staged source %q: %w", sourcePath, err))
+		}
+		if contributionWritten != 1 {
+			return session.fail(fmt.Errorf("replace contribution dependencies: %w: source path %q has no written contribution", storage.ErrInvalidRequest, sourcePath))
 		}
 		if _, exists := updated[sourcePath]; exists {
 			return session.fail(fmt.Errorf("replace contribution dependencies: %w: duplicate source path %q", storage.ErrInvalidRequest, sourcePath))
@@ -405,11 +524,65 @@ func (session *contributionSession) ReplaceContributionDependencies(ctx context.
 		"INSERT OR IGNORE INTO contribution_dependencies (workspace, source_path, valid_from_version, target_path) VALUES ", rows); err != nil {
 		return session.fail(fmt.Errorf("replace contribution dependencies: %w", err))
 	}
-	for contributionIndex, contribution := range session.contributions {
-		if replacement, found := updated[contribution.SourcePath()]; found {
-			session.contributions[contributionIndex] = replacement
-		}
+	return nil
+}
+
+func (session *contributionSession) WriteWorkspaceFacts(ctx context.Context, facts graph.Facts) error {
+	if session.closed {
+		return fmt.Errorf("write workspace facts: %w: session is closed", storage.ErrInvalidRequest)
 	}
+	if !session.sealed {
+		return fmt.Errorf("write workspace facts: %w: contributions are not sealed", storage.ErrInvalidRequest)
+	}
+	if session.workspaceFactsSealed {
+		return fmt.Errorf("write workspace facts: %w: workspace facts are sealed", storage.ErrInvalidRequest)
+	}
+	if err := ctx.Err(); err != nil {
+		return session.fail(fmt.Errorf("write workspace facts: %w", err))
+	}
+	if err := storeWorkspaceFacts(ctx, session.transaction, session.store.variableLimit, session.store.workspaceFactBatchLimits, session.workspace, session.pendingVersion, facts, session.recordWriteMeasurement); err != nil {
+		return session.fail(err)
+	}
+	session.workspaceFactsWritten = true
+	return nil
+}
+
+func (session *contributionSession) SealWorkspaceFacts(ctx context.Context) (storage.FactCounts, error) {
+	if session.closed {
+		return storage.FactCounts{}, fmt.Errorf("seal workspace facts: %w: session is closed", storage.ErrInvalidRequest)
+	}
+	if !session.sealed {
+		return storage.FactCounts{}, fmt.Errorf("seal workspace facts: %w: contributions are not sealed", storage.ErrInvalidRequest)
+	}
+	if err := ctx.Err(); err != nil {
+		return storage.FactCounts{}, session.fail(fmt.Errorf("seal workspace facts: %w", err))
+	}
+	if err := session.closeMissingSources(ctx); err != nil {
+		return storage.FactCounts{}, err
+	}
+	counts := storage.FactCounts{}
+	if err := session.transaction.QueryRowContext(ctx, "SELECT COUNT(*) FROM workspace_nodes WHERE workspace = ? AND version = ?", session.workspace, session.pendingVersion).Scan(&counts.Nodes); err != nil {
+		return storage.FactCounts{}, session.fail(fmt.Errorf("count staged workspace nodes: %w", err))
+	}
+	if err := session.transaction.QueryRowContext(ctx, "SELECT COUNT(*) FROM workspace_edges WHERE workspace = ? AND version = ?", session.workspace, session.pendingVersion).Scan(&counts.Edges); err != nil {
+		return storage.FactCounts{}, session.fail(fmt.Errorf("count staged workspace edges: %w", err))
+	}
+	session.workspaceFactsSealed = true
+	return counts, nil
+}
+
+func (session *contributionSession) closeMissingSources(ctx context.Context) error {
+	if session.missingSourcesClosed {
+		return nil
+	}
+	if session.pendingVersion == 1 {
+		session.missingSourcesClosed = true
+		return nil
+	}
+	if err := closeContributionsMissingFromStagedSources(ctx, session.transaction, session.workspace, session.pendingVersion); err != nil {
+		return session.fail(fmt.Errorf("close missing source contributions: %w", err))
+	}
+	session.missingSourcesClosed = true
 	return nil
 }
 
@@ -417,20 +590,28 @@ func (session *contributionSession) Commit(ctx context.Context, request storage.
 	if session.closed {
 		return storage.Snapshot{}, fmt.Errorf("commit contribution session: %w: session is closed", storage.ErrInvalidRequest)
 	}
+	if session.workspaceFactsWritten && !session.workspaceFactsSealed {
+		return storage.Snapshot{}, fmt.Errorf("commit contribution session: %w: workspace facts are not sealed", storage.ErrInvalidRequest)
+	}
 	if err := session.batch.flush(ctx, session.transaction); err != nil {
 		return storage.Snapshot{}, session.fail(err)
 	}
+	if err := session.closeMissingSources(ctx); err != nil {
+		return storage.Snapshot{}, err
+	}
+	session.reportWriteMeasurements(request.SQLiteWriteMeasurement)
 	publishedAt := time.Now().UTC()
 	if err := insertRows(ctx, session.transaction, session.store.variableLimit, maximumBatchRows,
 		"INSERT INTO graph_versions (workspace, version, published_at) VALUES ",
 		[][]any{{session.workspace, session.pendingVersion, publishedAt.Format(time.RFC3339Nano)}}); err != nil {
 		return storage.Snapshot{}, session.fail(fmt.Errorf("record graph publication: %w", err))
 	}
-	if err := retainWorkspaceFacts(ctx, session.transaction, session.workspace, session.pendingVersion, request.ReplacedWorkspaceFactOwners); err != nil {
-		return storage.Snapshot{}, session.fail(err)
-	}
-	if err := storeWorkspaceFacts(ctx, session.transaction, session.store.variableLimit, session.workspace, session.pendingVersion, request.WorkspaceFacts, request.SQLiteWriteMeasurement); err != nil {
-		return storage.Snapshot{}, session.fail(err)
+	for _, name := range []string{"workspace_nodes", "workspace_edges"} {
+		if duration, found := session.writeMeasurements[name]; found {
+			reportPublishMeasurement(request.SQLiteWriteMeasurement, name, duration)
+		} else if request.SQLiteWriteMeasurement != nil {
+			request.SQLiteWriteMeasurement(storage.PublishMeasurement{Name: name, NotApplicable: true})
+		}
 	}
 	if session.pendingVersion > retainedGraphVersions {
 		if _, err := pruneVersions(ctx, session.transaction, session.workspace, session.pendingVersion-retainedGraphVersions+1); err != nil {
@@ -440,21 +621,23 @@ func (session *contributionSession) Commit(ctx context.Context, request storage.
 	if err := ensureDatabaseBudget(ctx, session.transaction, session.store.maxDatabaseBytes); err != nil {
 		return storage.Snapshot{}, session.fail(err)
 	}
+	if _, err := session.transaction.ExecContext(ctx,
+		"DELETE FROM contribution_session_sources WHERE workspace = ? AND pending_version = ?",
+		session.workspace, session.pendingVersion); err != nil {
+		return storage.Snapshot{}, session.fail(fmt.Errorf("remove contribution session sources: %w", err))
+	}
 
 	commitStarted := time.Now()
 	if err := session.transaction.Commit(); err != nil {
-		session.closed = true
-		return storage.Snapshot{}, fmt.Errorf("commit contribution session: %w", err)
+		return storage.Snapshot{}, session.fail(fmt.Errorf("commit contribution session: %w", err))
 	}
 	session.closed = true
 	reportPublishMeasurement(request.Measurement, storage.CommitMeasurement, time.Since(commitStarted))
 	reportPublishMeasurement(request.Measurement, storage.StagedTransactionMeasurement, time.Since(session.beganAt))
 
-	var update extractor.GraphUpdate
-	if len(session.contributions) > 0 {
-		update, _ = extractor.NewGraphUpdate(session.contributions)
-	}
-	session.store.cachePublishedContributions(session.workspace, session.pendingVersion, update)
+	session.store.invalidateWorkspaceCaches(session.workspace, func(cachedVersion storage.GraphVersion) bool {
+		return cachedVersion == session.pendingVersion
+	})
 	_ = reclaimFreePages(ctx, session.store.database)
 	return storage.Snapshot{Workspace: session.workspace, Version: session.pendingVersion, PublishedAt: publishedAt}, nil
 }
@@ -474,21 +657,28 @@ func (session *contributionSession) ResolverProjectionPage(ctx context.Context, 
 	if session.closed {
 		return nil, fmt.Errorf("read contribution session resolver projection page: %w: session is closed", storage.ErrInvalidRequest)
 	}
+	if !session.sealed {
+		return nil, fmt.Errorf("read contribution session resolver projection page: %w: contributions are not sealed", storage.ErrInvalidRequest)
+	}
 	if snapshot.Workspace != session.workspace || request.ProjectID == "" || request.Language == "" || request.Limit <= 0 {
 		return nil, fmt.Errorf("read contribution session resolver projection page: %w: snapshot, project, language, and positive limit are required", storage.ErrInvalidRequest)
 	}
 	rows, err := session.transaction.QueryContext(ctx, `
-		SELECT source_path, project_id, extractor_name, extractor_version
-		FROM file_contributions
-		WHERE workspace = ?
-			AND valid_from_version <= ?
-			AND (valid_to_version IS NULL OR valid_to_version >= ?)
-			AND project_id = ?
-			AND extractor_name = ?
-			AND source_path > ?
-		ORDER BY source_path
+		SELECT contributions.source_path, contributions.project_id, contributions.extractor_name, contributions.extractor_version
+		FROM file_contributions contributions
+		JOIN contribution_session_sources sources
+			ON sources.workspace = contributions.workspace
+			AND sources.pending_version = ?
+			AND sources.source_path = contributions.source_path
+		WHERE contributions.workspace = ?
+			AND contributions.valid_from_version <= ?
+			AND (contributions.valid_to_version IS NULL OR contributions.valid_to_version >= ?)
+			AND contributions.project_id = ?
+			AND contributions.extractor_name = ?
+			AND contributions.source_path > ?
+		ORDER BY contributions.source_path
 		LIMIT ?`,
-		session.workspace, session.pendingVersion, session.pendingVersion,
+		session.pendingVersion, session.workspace, session.pendingVersion, session.pendingVersion,
 		request.ProjectID, request.Language, request.AfterSourcePath, request.Limit)
 	if err != nil {
 		return nil, fmt.Errorf("read contribution session resolver projection page: %w", err)
@@ -516,6 +706,11 @@ func (session *contributionSession) ResolverProjectionPage(ctx context.Context, 
 			return nil, err
 		}
 		projection.Metadata.Extensions = data.Metadata.Extensions
+		var facts graph.Facts
+		if err := appendNodes(ctx, session.transaction, &facts, `SELECT node_id, kind, label, qualified_name, span_path, start_line, start_column, end_line, end_column, file_hash, extractor, provenance, confidence FROM contribution_nodes WHERE workspace = ? AND source_path = ? AND valid_from_version <= ? AND (valid_to_version IS NULL OR valid_to_version >= ?) ORDER BY node_id`, session.workspace, projection.SourcePath, session.pendingVersion, session.pendingVersion); err != nil {
+			return nil, err
+		}
+		projection.Nodes = facts.Nodes
 		if err := projection.Metadata.Validate(); err != nil {
 			return nil, fmt.Errorf("read contribution session resolver projection %q: metadata: %w", projection.SourcePath, err)
 		}
@@ -532,20 +727,27 @@ func (session *contributionSession) ResolverTarget(ctx context.Context, snapshot
 	if session.closed {
 		return extractor.ResolverTarget{}, false, fmt.Errorf("read contribution session resolver target: %w: session is closed", storage.ErrInvalidRequest)
 	}
+	if !session.sealed {
+		return extractor.ResolverTarget{}, false, fmt.Errorf("read contribution session resolver target: %w: contributions are not sealed", storage.ErrInvalidRequest)
+	}
 	if snapshot.Workspace != session.workspace || request.ProjectID == "" || request.Language == "" || request.SourcePath == "" {
 		return extractor.ResolverTarget{}, false, fmt.Errorf("read contribution session resolver target: %w: snapshot, project, language, and source path are required", storage.ErrInvalidRequest)
 	}
 	target := extractor.ResolverTarget{ProjectID: request.ProjectID, SourcePath: request.SourcePath}
 	err := session.transaction.QueryRowContext(ctx, `
-		SELECT extractor_name, extractor_version
-		FROM file_contributions
-		WHERE workspace = ?
-			AND valid_from_version <= ?
-			AND (valid_to_version IS NULL OR valid_to_version >= ?)
-			AND project_id = ?
-			AND extractor_name = ?
-			AND source_path = ?`,
-		session.workspace, session.pendingVersion, session.pendingVersion,
+		SELECT contributions.extractor_name, contributions.extractor_version
+		FROM file_contributions contributions
+		JOIN contribution_session_sources sources
+			ON sources.workspace = contributions.workspace
+			AND sources.pending_version = ?
+			AND sources.source_path = contributions.source_path
+		WHERE contributions.workspace = ?
+			AND contributions.valid_from_version <= ?
+			AND (contributions.valid_to_version IS NULL OR contributions.valid_to_version >= ?)
+			AND contributions.project_id = ?
+			AND contributions.extractor_name = ?
+			AND contributions.source_path = ?`,
+		session.pendingVersion, session.workspace, session.pendingVersion, session.pendingVersion,
 		request.ProjectID, request.Language, request.SourcePath,
 	).Scan(&target.Metadata.Name, &target.Metadata.Version)
 	if errors.Is(err, sql.ErrNoRows) {
@@ -583,18 +785,21 @@ func (session *contributionSession) ResolverPackagePage(ctx context.Context, sna
 	if session.closed {
 		return nil, fmt.Errorf("read contribution session resolver package page: %w: session is closed", storage.ErrInvalidRequest)
 	}
+	if !session.sealed {
+		return nil, fmt.Errorf("read contribution session resolver package page: %w: contributions are not sealed", storage.ErrInvalidRequest)
+	}
 	if snapshot.Workspace != session.workspace || request.ProjectID == "" || request.Language == "" || request.PackagePath == "" || request.Limit <= 0 {
 		return nil, fmt.Errorf("read contribution session resolver package page: %w: snapshot, project, language, package path, and positive limit are required", storage.ErrInvalidRequest)
 	}
-	pathFilter := "source_path LIKE ? AND INSTR(source_path, '/') = 0"
+	pathFilter := "contributions.source_path LIKE ? AND INSTR(contributions.source_path, '/') = 0"
 	pathArguments := []any{"%"}
 	if request.PackagePath != "." {
 		prefix := request.PackagePath + "/"
-		pathFilter = "source_path LIKE ? AND INSTR(SUBSTR(source_path, LENGTH(?) + 1), '/') = 0"
+		pathFilter = "contributions.source_path LIKE ? AND INSTR(SUBSTR(contributions.source_path, LENGTH(?) + 1), '/') = 0"
 		pathArguments = []any{prefix + "%", prefix}
 	}
-	query := `SELECT source_path FROM file_contributions WHERE workspace = ? AND valid_from_version <= ? AND (valid_to_version IS NULL OR valid_to_version >= ?) AND project_id = ? AND extractor_name = ? AND ` + pathFilter + ` AND source_path > ? ORDER BY source_path LIMIT ?`
-	arguments := []any{session.workspace, session.pendingVersion, session.pendingVersion, request.ProjectID, request.Language}
+	query := `SELECT contributions.source_path FROM file_contributions contributions JOIN contribution_session_sources sources ON sources.workspace = contributions.workspace AND sources.pending_version = ? AND sources.source_path = contributions.source_path WHERE contributions.workspace = ? AND contributions.valid_from_version <= ? AND (contributions.valid_to_version IS NULL OR contributions.valid_to_version >= ?) AND contributions.project_id = ? AND contributions.extractor_name = ? AND ` + pathFilter + ` AND contributions.source_path > ? ORDER BY contributions.source_path LIMIT ?`
+	arguments := []any{session.pendingVersion, session.workspace, session.pendingVersion, session.pendingVersion, request.ProjectID, request.Language}
 	arguments = append(arguments, pathArguments...)
 	arguments = append(arguments, request.AfterSourcePath, request.Limit)
 	rows, err := session.transaction.QueryContext(ctx, query, arguments...)
@@ -713,6 +918,11 @@ func (stager *resolverStager) ResolverProjectionPage(ctx context.Context, snapsh
 			return nil, err
 		}
 		projection.Metadata.Extensions = data.Metadata.Extensions
+		var facts graph.Facts
+		if err := appendNodes(ctx, stager.transaction, &facts, `SELECT node_id, kind, label, qualified_name, span_path, start_line, start_column, end_line, end_column, file_hash, extractor, provenance, confidence FROM contribution_nodes WHERE workspace = ? AND source_path = ? AND valid_from_version <= ? AND (valid_to_version IS NULL OR valid_to_version >= ?) ORDER BY node_id`, stager.workspace, projection.SourcePath, stager.snapshot.Version, stager.snapshot.Version); err != nil {
+			return nil, err
+		}
+		projection.Nodes = facts.Nodes
 		projection.UnresolvedReferences = data.UnresolvedReferences
 		projection.SymbolReferences = data.SymbolReferences
 		projection.ExportedSurfaces = data.ExportedSurfaces
@@ -854,11 +1064,11 @@ type preparedContribution struct {
 	symbolRows       [][]any
 }
 
-func storePreparedPublication(ctx context.Context, transaction *sql.Tx, variableLimit int, workspace string, version storage.GraphVersion, workspaceFacts graph.Facts, replacedOwners []string, reportWriteMeasurement func(storage.PublishMeasurement), contributions []encodedContribution, reportProgress func(int, int, int)) error {
+func storePreparedPublication(ctx context.Context, transaction *sql.Tx, variableLimit int, factLimits factBatchLimits, workspace string, version storage.GraphVersion, workspaceFacts graph.Facts, replacedOwners []string, reportWriteMeasurement func(storage.PublishMeasurement), contributions []encodedContribution, reportProgress func(int, int, int)) error {
 	if err := retainWorkspaceFacts(ctx, transaction, workspace, version, replacedOwners); err != nil {
 		return err
 	}
-	if err := storeWorkspaceFacts(ctx, transaction, variableLimit, workspace, version, workspaceFacts, reportWriteMeasurement); err != nil {
+	if err := storeWorkspaceFacts(ctx, transaction, variableLimit, factLimits, workspace, version, workspaceFacts, reportWriteMeasurement); err != nil {
 		return err
 	}
 	writtenNodes, writtenEdges := len(workspaceFacts.Nodes), len(workspaceFacts.Edges)
@@ -1062,6 +1272,21 @@ type publicationBatch struct {
 	variableLimit          int
 	reportWriteMeasurement func(storage.PublishMeasurement)
 	insertions             []publicationInsertion
+	limits                 contributionBatchLimits
+	rowCount               int
+	estimatedBytes         int
+	sourceCount            int
+}
+
+type contributionBatchLimits struct {
+	maximumRows    int
+	maximumBytes   int
+	maximumSources int
+}
+
+type factBatchLimits struct {
+	maximumRows  int
+	maximumBytes int
 }
 
 func newPublicationBatch(variableLimit int, reportWriteMeasurement func(storage.PublishMeasurement)) publicationBatch {
@@ -1081,11 +1306,6 @@ func newPublicationBatch(variableLimit int, reportWriteMeasurement func(storage.
 
 func (batch *publicationBatch) add(ctx context.Context, transaction *sql.Tx, workspace string, version storage.GraphVersion, prepared preparedContribution) error {
 	contribution := prepared.contribution
-	if version > 1 {
-		if err := closeContributionRecords(ctx, transaction, workspace, contribution.sourcePath, int64(version)-1); err != nil {
-			return fmt.Errorf("close prior source contribution: %w", err)
-		}
-	}
 	rows := [][][]any{
 		prepared.contributionRows,
 		prepared.nodeRows,
@@ -1098,13 +1318,38 @@ func (batch *publicationBatch) add(ctx context.Context, transaction *sql.Tx, wor
 		prepared.bindingRows,
 		prepared.symbolRows,
 	}
+	preparedRowCount := 0
+	for _, insertionRows := range rows {
+		preparedRowCount += len(insertionRows)
+	}
+	preparedBytes := estimateContributionRowsBytes(rows)
+	if batch.sourceCount > 0 && (batch.limits.maximumRows > 0 && batch.rowCount+preparedRowCount > batch.limits.maximumRows ||
+		batch.limits.maximumBytes > 0 && batch.estimatedBytes+preparedBytes > batch.limits.maximumBytes) {
+		if err := batch.flush(ctx, transaction); err != nil {
+			return err
+		}
+	}
+	if version > 1 {
+		if err := closeContributionRecords(ctx, transaction, workspace, contribution.sourcePath, int64(version)-1); err != nil {
+			return fmt.Errorf("close prior source contribution: %w", err)
+		}
+	}
+	legacyBatch := batch.limits.maximumRows == 0 && batch.limits.maximumBytes == 0 && batch.limits.maximumSources == 0
 	for index, insertionRows := range rows {
 		batch.insertions[index].rows = append(batch.insertions[index].rows, insertionRows...)
-		if len(batch.insertions[index].rows) >= maximumBatchRows {
+		if legacyBatch && len(batch.insertions[index].rows) >= maximumBatchRows {
 			if err := batch.flushInsertion(ctx, transaction, index); err != nil {
 				return err
 			}
 		}
+	}
+	batch.rowCount += preparedRowCount
+	batch.estimatedBytes += preparedBytes
+	batch.sourceCount++
+	if batch.limits.maximumRows > 0 && batch.rowCount >= batch.limits.maximumRows ||
+		batch.limits.maximumBytes > 0 && batch.estimatedBytes >= batch.limits.maximumBytes ||
+		batch.limits.maximumSources > 0 && batch.sourceCount >= batch.limits.maximumSources {
+		return batch.flush(ctx, transaction)
 	}
 	return nil
 }
@@ -1115,13 +1360,43 @@ func (batch *publicationBatch) flush(ctx context.Context, transaction *sql.Tx) e
 			return err
 		}
 	}
+	batch.rowCount = 0
+	batch.estimatedBytes = 0
+	batch.sourceCount = 0
 	return nil
+}
+
+func estimateContributionRowsBytes(groups [][][]any) int {
+	estimatedBytes := 0
+	for _, rows := range groups {
+		for _, row := range rows {
+			estimatedBytes += 8
+			for _, value := range row {
+				switch typed := value.(type) {
+				case string:
+					estimatedBytes += len(typed)
+				case []byte:
+					estimatedBytes += len(typed)
+				default:
+					estimatedBytes += 8
+				}
+			}
+		}
+	}
+	return estimatedBytes
 }
 
 func (batch *publicationBatch) flushInsertion(ctx context.Context, transaction *sql.Tx, index int) error {
 	insertion := &batch.insertions[index]
+	if len(insertion.rows) == 0 {
+		return nil
+	}
 	started := time.Now()
-	if err := insertRows(ctx, transaction, batch.variableLimit, maximumBatchRows, insertion.prefix, insertion.rows); err != nil {
+	maximumRows := batch.limits.maximumRows
+	if maximumRows <= 0 {
+		maximumRows = maximumBatchRows
+	}
+	if err := insertRows(ctx, transaction, batch.variableLimit, maximumRows, insertion.prefix, insertion.rows); err != nil {
 		return fmt.Errorf("store %s: %w", insertion.name, err)
 	}
 	reportPublishMeasurement(batch.reportWriteMeasurement, insertion.name, time.Since(started))
@@ -1155,40 +1430,97 @@ func (store *Store) AffectedSources(ctx context.Context, snapshot storage.Snapsh
 		return nil, fmt.Errorf("find affected sources: %w: snapshot and update are required", storage.ErrInvalidRequest)
 	}
 
-	stored, err := store.readResolutionData(ctx, snapshot)
-	if err != nil {
-		return nil, err
-	}
 	updates := request.Update.Contributions()
 	changedTargets := make(map[string]struct{}, len(updates))
 	for _, contribution := range updates {
-		current, found := stored[contribution.SourcePath()]
-		if !found || !sameSurfaces(current.ExportedSurfaces, contribution.ExportedSurfaces()) {
+		current, found, err := store.readExportedSurfaces(ctx, snapshot, contribution.SourcePath())
+		if err != nil {
+			return nil, err
+		}
+		if !found || !sameSurfaces(current, contribution.ExportedSurfaces()) {
 			changedTargets[contribution.SourcePath()] = struct{}{}
 		}
 	}
-
+	if len(changedTargets) == 0 {
+		return nil, nil
+	}
+	paths := make([]string, 0, len(changedTargets))
+	for path := range changedTargets {
+		paths = append(paths, path)
+	}
+	sort.Strings(paths)
+	maximumPaths := max(1, store.variableLimit-3)
 	affected := make(map[string]struct{})
-	for sourcePath, contribution := range stored {
-		if _, updating := changedTargets[sourcePath]; updating {
-			continue
+	for start := 0; start < len(paths); start += maximumPaths {
+		end := min(start+maximumPaths, len(paths))
+		chunk := paths[start:end]
+		placeholders := strings.TrimSuffix(strings.Repeat("?,", len(chunk)), ",")
+		arguments := []any{snapshot.Workspace, snapshot.Version, snapshot.Version}
+		for _, path := range chunk {
+			arguments = append(arguments, path)
 		}
-		for _, dependency := range contribution.Dependencies {
-			if _, changed := changedTargets[dependency.TargetPath]; changed {
-				affected[sourcePath] = struct{}{}
-				break
+		rows, err := store.database.QueryContext(ctx, `
+			SELECT DISTINCT source_path
+			FROM contribution_dependencies
+			WHERE workspace = ?
+				AND valid_from_version <= ?
+				AND (valid_to_version IS NULL OR valid_to_version >= ?)
+				AND target_path IN (`+placeholders+`)
+			ORDER BY source_path`, arguments...)
+		if err != nil {
+			return nil, fmt.Errorf("find affected source dependencies: %w", err)
+		}
+		for rows.Next() {
+			var sourcePath string
+			if err := rows.Scan(&sourcePath); err != nil {
+				_ = rows.Close()
+				return nil, fmt.Errorf("read affected source dependency: %w", err)
 			}
+			if _, changed := changedTargets[sourcePath]; !changed {
+				affected[sourcePath] = struct{}{}
+			}
+		}
+		if err := rows.Err(); err != nil {
+			_ = rows.Close()
+			return nil, fmt.Errorf("iterate affected source dependencies: %w", err)
+		}
+		if err := rows.Close(); err != nil {
+			return nil, fmt.Errorf("close affected source dependencies: %w", err)
 		}
 	}
 	return uniqueSortedStringsMap(affected), nil
 }
 
+func (store *Store) readExportedSurfaces(ctx context.Context, snapshot storage.Snapshot, sourcePath string) ([]extractor.ExportedSurface, bool, error) {
+	var exists int
+	if err := store.database.QueryRowContext(ctx, `SELECT COUNT(*) FROM file_contributions WHERE workspace = ? AND source_path = ? AND valid_from_version <= ? AND (valid_to_version IS NULL OR valid_to_version >= ?)`, snapshot.Workspace, sourcePath, snapshot.Version, snapshot.Version).Scan(&exists); err != nil {
+		return nil, false, fmt.Errorf("read affected source contribution: %w", err)
+	}
+	if exists == 0 {
+		return nil, false, nil
+	}
+	rows, err := store.database.QueryContext(ctx, `SELECT node_id, name FROM contribution_exported_surfaces WHERE workspace = ? AND source_path = ? AND valid_from_version <= ? AND (valid_to_version IS NULL OR valid_to_version >= ?) ORDER BY node_id, name`, snapshot.Workspace, sourcePath, snapshot.Version, snapshot.Version)
+	if err != nil {
+		return nil, false, fmt.Errorf("read affected source exported surfaces: %w", err)
+	}
+	defer rows.Close()
+	surfaces := make([]extractor.ExportedSurface, 0)
+	for rows.Next() {
+		var surface extractor.ExportedSurface
+		if err := rows.Scan(&surface.NodeID, &surface.Name); err != nil {
+			return nil, false, fmt.Errorf("read affected source exported surface: %w", err)
+		}
+		surfaces = append(surfaces, surface)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, false, fmt.Errorf("iterate affected source exported surfaces: %w", err)
+	}
+	return surfaces, true, nil
+}
+
 func (store *Store) SourceContributions(ctx context.Context, snapshot storage.Snapshot) ([]storage.SourceContribution, error) {
 	if snapshot.Workspace == "" || snapshot.Version == 0 {
 		return nil, fmt.Errorf("read source contributions: %w: snapshot is required", storage.ErrInvalidRequest)
-	}
-	if contributions, found := store.cachedSourceContributions(snapshot); found {
-		return contributions, nil
 	}
 
 	rows, err := store.database.QueryContext(ctx, `
@@ -1253,7 +1585,6 @@ func (store *Store) SourceContributions(ctx context.Context, snapshot storage.Sn
 			Diagnostics:          data.Diagnostics,
 		})
 	}
-	store.cacheSourceContributions(snapshot, contributions)
 	return contributions, nil
 }
 
@@ -1301,6 +1632,11 @@ func (store *Store) ResolverProjections(ctx context.Context, snapshot storage.Sn
 			return nil, err
 		}
 		projection.Metadata.Extensions = data.Metadata.Extensions
+		var facts graph.Facts
+		if err := appendNodes(ctx, store.database, &facts, `SELECT node_id, kind, label, qualified_name, span_path, start_line, start_column, end_line, end_column, file_hash, extractor, provenance, confidence FROM contribution_nodes WHERE workspace = ? AND source_path = ? AND valid_from_version <= ? AND (valid_to_version IS NULL OR valid_to_version >= ?) ORDER BY node_id`, snapshot.Workspace, projection.SourcePath, snapshot.Version, snapshot.Version); err != nil {
+			return nil, err
+		}
+		projection.Nodes = facts.Nodes
 		if err := projection.Metadata.Validate(); err != nil {
 			return nil, fmt.Errorf("read resolver projection %q: metadata: %w", projection.SourcePath, err)
 		}
@@ -1363,6 +1699,11 @@ func (store *Store) ResolverProjectionPage(ctx context.Context, snapshot storage
 			return nil, err
 		}
 		projection.Metadata.Extensions = data.Metadata.Extensions
+		var facts graph.Facts
+		if err := appendNodes(ctx, store.database, &facts, `SELECT node_id, kind, label, qualified_name, span_path, start_line, start_column, end_line, end_column, file_hash, extractor, provenance, confidence FROM contribution_nodes WHERE workspace = ? AND source_path = ? AND valid_from_version <= ? AND (valid_to_version IS NULL OR valid_to_version >= ?) ORDER BY node_id`, snapshot.Workspace, projection.SourcePath, snapshot.Version, snapshot.Version); err != nil {
+			return nil, err
+		}
+		projection.Nodes = facts.Nodes
 		if err := projection.Metadata.Validate(); err != nil {
 			return nil, fmt.Errorf("read resolver projection %q: metadata: %w", projection.SourcePath, err)
 		}
@@ -1545,7 +1886,7 @@ func (store *Store) oldestResolverProjection() (projectionCacheKey, cachedProjec
 	return oldestKey, oldest, found
 }
 
-func (store *Store) removeResolverProjections(workspace string, remove func(storage.GraphVersion) bool) {
+func (store *Store) invalidateWorkspaceCaches(workspace string, remove func(storage.GraphVersion) bool) {
 	store.projectionMu.Lock()
 	defer store.projectionMu.Unlock()
 	for key, projection := range store.projections {
@@ -1561,6 +1902,9 @@ func resolverProjectionBytes(projections []storage.ResolverProjection) int64 {
 	var bytes int64
 	for _, projection := range projections {
 		bytes += int64(len(projection.ProjectID) + len(projection.SourcePath) + len(projection.Metadata.Name) + len(projection.Metadata.Version))
+		for _, node := range projection.Nodes {
+			bytes += int64(len(node.ID)+len(node.Kind)+len(node.Label)+len(node.QualifiedName)) + evidenceBytes(node.Evidence)
+		}
 		for _, extension := range projection.Metadata.Extensions {
 			bytes += int64(len(extension))
 		}
@@ -1591,71 +1935,6 @@ func evidenceBytes(evidence graph.FactEvidence) int64 {
 	return int64(len(evidence.Span.Path) + len(evidence.FileHash) + len(evidence.Extractor) + len(evidence.Provenance) + len(evidence.Confidence))
 }
 
-func (store *Store) cachedSourceContributions(snapshot storage.Snapshot) ([]storage.SourceContribution, bool) {
-	store.contributionMu.RLock()
-	cached, found := store.contributions[snapshot.Workspace]
-	store.contributionMu.RUnlock()
-	if !found || cached.version != snapshot.Version {
-		return nil, false
-	}
-	return copySourceContributions(cached.values), true
-}
-
-func (store *Store) cacheSourceContributions(snapshot storage.Snapshot, contributions []storage.SourceContribution) {
-	store.contributionMu.Lock()
-	store.contributions[snapshot.Workspace] = cachedContributions{version: snapshot.Version, values: copySourceContributions(contributions)}
-	store.contributionMu.Unlock()
-}
-
-func (store *Store) cachePublishedContributions(workspace string, version storage.GraphVersion, update extractor.GraphUpdate) {
-	store.contributionMu.Lock()
-	defer store.contributionMu.Unlock()
-
-	byPath := make(map[string]storage.SourceContribution)
-	if cached, found := store.contributions[workspace]; found && cached.version+1 == version {
-		for _, contribution := range cached.values {
-			byPath[contribution.SourcePath] = contribution
-		}
-	} else if version != 1 {
-		delete(store.contributions, workspace)
-		return
-	}
-	for _, contribution := range update.Contributions() {
-		byPath[contribution.SourcePath()] = sourceContribution(contribution)
-	}
-	paths := make([]string, 0, len(byPath))
-	for sourcePath := range byPath {
-		paths = append(paths, sourcePath)
-	}
-	sort.Strings(paths)
-	values := make([]storage.SourceContribution, 0, len(paths))
-	for _, sourcePath := range paths {
-		values = append(values, byPath[sourcePath])
-	}
-	store.contributions[workspace] = cachedContributions{version: version, values: values}
-}
-
-func sourceContribution(contribution extractor.Contribution) storage.SourceContribution {
-	return storage.SourceContribution{
-		SourcePath:           contribution.SourcePath(),
-		Metadata:             contribution.Metadata(),
-		Facts:                contribution.Facts(),
-		UnresolvedReferences: contribution.UnresolvedReferences(),
-		SymbolReferences:     contribution.SymbolReferences(),
-		ExportedSurfaces:     contribution.ExportedSurfaces(),
-		Dependencies:         contribution.Dependencies(),
-		Diagnostics:          contribution.Diagnostics(),
-	}
-}
-
-func copySourceContributions(contributions []storage.SourceContribution) []storage.SourceContribution {
-	copied := make([]storage.SourceContribution, len(contributions))
-	for index, contribution := range contributions {
-		copied[index] = sourceContributionFromStorage(contribution)
-	}
-	return copied
-}
-
 func copyResolverProjections(projections []storage.ResolverProjection) []storage.ResolverProjection {
 	copied := make([]storage.ResolverProjection, len(projections))
 	for index, projection := range projections {
@@ -1663,6 +1942,7 @@ func copyResolverProjections(projections []storage.ResolverProjection) []storage
 			ProjectID:            projection.ProjectID,
 			SourcePath:           projection.SourcePath,
 			Metadata:             extractor.Metadata{Name: projection.Metadata.Name, Version: projection.Metadata.Version, Extensions: append([]string(nil), projection.Metadata.Extensions...)},
+			Nodes:                append([]graph.Node(nil), projection.Nodes...),
 			UnresolvedReferences: copyUnresolvedReferences(projection.UnresolvedReferences),
 			SymbolReferences:     append([]extractor.SymbolReference(nil), projection.SymbolReferences...),
 			ExportedSurfaces:     append([]extractor.ExportedSurface(nil), projection.ExportedSurfaces...),
@@ -1756,6 +2036,47 @@ func (store *Store) LookupNodes(ctx context.Context, snapshot storage.Snapshot, 
 	}
 	return matches, nil
 }
+
+func (store *Store) LookupExactNodes(ctx context.Context, snapshot storage.Snapshot, identifier string) ([]storage.NodeMatch, error) {
+	if snapshot.Workspace == "" || snapshot.Version == 0 || identifier == "" {
+		return nil, fmt.Errorf("look up exact graph nodes: %w: snapshot and identifier are required", storage.ErrInvalidRequest)
+	}
+
+	rows, err := store.database.QueryContext(ctx, exactNodeLookupSQL, snapshot.Workspace, snapshot.Version, snapshot.Version, snapshot.Workspace, snapshot.Version, identifier, identifier, identifier)
+	if err != nil {
+		return nil, fmt.Errorf("look up exact graph nodes: %w", err)
+	}
+	defer rows.Close()
+
+	matches := make([]storage.NodeMatch, 0)
+	for rows.Next() {
+		var match storage.NodeMatch
+		targets := append([]any{&match.Score, &match.Node.ID, &match.Node.Kind, &match.Node.Label, &match.Node.QualifiedName}, evidenceScanTargets(&match.Node.Evidence)...)
+		if err := rows.Scan(targets...); err != nil {
+			return nil, fmt.Errorf("read exact graph node match: %w", err)
+		}
+		matches = append(matches, match)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("iterate exact graph node matches: %w", err)
+	}
+	return matches, nil
+}
+
+const exactNodeLookupSQL = `
+	WITH visible_nodes AS (
+		SELECT node_id, kind, label, qualified_name, span_path, start_line, start_column, end_line, end_column, file_hash, extractor, provenance, confidence
+		FROM contribution_nodes
+		WHERE workspace = ? AND valid_from_version <= ? AND (valid_to_version IS NULL OR valid_to_version >= ?)
+		UNION
+		SELECT node_id, kind, label, qualified_name, span_path, start_line, start_column, end_line, end_column, file_hash, extractor, provenance, confidence
+		FROM workspace_nodes
+		WHERE workspace = ? AND version = ?
+	)
+	SELECT 0, node_id, kind, label, qualified_name, span_path, start_line, start_column, end_line, end_column, file_hash, extractor, provenance, confidence
+	FROM visible_nodes
+	WHERE node_id = ? OR qualified_name = ? OR (kind = 'file' AND span_path = ?)
+	ORDER BY qualified_name, label, node_id`
 
 func nodeLookupQuery(snapshot storage.Snapshot, request storage.NodeLookupRequest) (string, []any) {
 	term := request.Text
@@ -2141,6 +2462,9 @@ func (store *Store) Export(ctx context.Context, snapshot storage.Snapshot, reque
 	if snapshot.Workspace == "" || snapshot.Version == 0 || sink == nil {
 		return fmt.Errorf("export graph: %w: snapshot and sink are required", storage.ErrInvalidRequest)
 	}
+	if request.IsUnfiltered() {
+		return store.exportUnfiltered(ctx, snapshot, sink)
+	}
 
 	facts, err := store.readFacts(ctx, snapshot)
 	if err != nil {
@@ -2193,12 +2517,101 @@ func (store *Store) Export(ctx context.Context, snapshot storage.Snapshot, reque
 	return nil
 }
 
+func (store *Store) exportUnfiltered(ctx context.Context, snapshot storage.Snapshot, sink storage.ExportSink) error {
+	nodeRows, err := store.database.QueryContext(ctx, `
+		WITH visible_nodes AS (
+			SELECT node_id, kind, label, qualified_name, span_path, start_line, start_column, end_line, end_column, file_hash, extractor, provenance, confidence, source_path, 0 AS precedence
+			FROM contribution_nodes
+			WHERE workspace = ? AND valid_from_version <= ? AND (valid_to_version IS NULL OR valid_to_version >= ?)
+			UNION ALL
+			SELECT node_id, kind, label, qualified_name, span_path, start_line, start_column, end_line, end_column, file_hash, extractor, provenance, confidence, '' AS source_path, 1 AS precedence
+			FROM workspace_nodes
+			WHERE workspace = ? AND version = ?
+		), ranked_nodes AS (
+			SELECT *, ROW_NUMBER() OVER (PARTITION BY node_id ORDER BY precedence DESC, source_path DESC) AS rank
+			FROM visible_nodes
+		)
+		SELECT node_id, kind, label, qualified_name, span_path, start_line, start_column, end_line, end_column, file_hash, extractor, provenance, confidence
+		FROM ranked_nodes WHERE rank = 1 ORDER BY node_id`,
+		snapshot.Workspace, snapshot.Version, snapshot.Version, snapshot.Workspace, snapshot.Version)
+	if err != nil {
+		return fmt.Errorf("export graph nodes: %w", err)
+	}
+	for nodeRows.Next() {
+		var node graph.Node
+		targets := append([]any{&node.ID, &node.Kind, &node.Label, &node.QualifiedName}, evidenceScanTargets(&node.Evidence)...)
+		if err := nodeRows.Scan(targets...); err != nil {
+			_ = nodeRows.Close()
+			return fmt.Errorf("export graph node: %w", err)
+		}
+		if err := sink.WriteNode(node); err != nil {
+			_ = nodeRows.Close()
+			return fmt.Errorf("export graph node %q: %w", node.ID, err)
+		}
+	}
+	if err := nodeRows.Err(); err != nil {
+		_ = nodeRows.Close()
+		return fmt.Errorf("export graph nodes: %w", err)
+	}
+	if err := nodeRows.Close(); err != nil {
+		return fmt.Errorf("export graph nodes: %w", err)
+	}
+
+	edgeRows, err := store.database.QueryContext(ctx, `
+		WITH visible_edges AS (
+			SELECT source_id, target_id, relation, span_path, start_line, start_column, end_line, end_column, file_hash, extractor, provenance, confidence, 0 AS precedence
+			FROM contribution_edges
+			WHERE workspace = ? AND valid_from_version <= ? AND (valid_to_version IS NULL OR valid_to_version >= ?)
+			UNION ALL
+			SELECT source_id, target_id, relation, span_path, start_line, start_column, end_line, end_column, file_hash, extractor, provenance, confidence, 1 AS precedence
+			FROM workspace_edges
+			WHERE workspace = ? AND version = ?
+		), ranked_edges AS (
+			SELECT *, ROW_NUMBER() OVER (PARTITION BY source_id, target_id, relation ORDER BY precedence DESC) AS rank
+			FROM visible_edges
+		)
+		SELECT source_id, target_id, relation, span_path, start_line, start_column, end_line, end_column, file_hash, extractor, provenance, confidence
+		FROM ranked_edges WHERE rank = 1 ORDER BY source_id, target_id, relation`,
+		snapshot.Workspace, snapshot.Version, snapshot.Version, snapshot.Workspace, snapshot.Version)
+	if err != nil {
+		return fmt.Errorf("export graph edges: %w", err)
+	}
+	for edgeRows.Next() {
+		var edge graph.Edge
+		targets := append([]any{&edge.SourceID, &edge.TargetID, &edge.Relation}, evidenceScanTargets(&edge.Evidence)...)
+		if err := edgeRows.Scan(targets...); err != nil {
+			_ = edgeRows.Close()
+			return fmt.Errorf("export graph edge: %w", err)
+		}
+		if err := sink.WriteEdge(edge); err != nil {
+			_ = edgeRows.Close()
+			return fmt.Errorf("export graph edge %q -> %q: %w", edge.SourceID, edge.TargetID, err)
+		}
+	}
+	if err := edgeRows.Err(); err != nil {
+		_ = edgeRows.Close()
+		return fmt.Errorf("export graph edges: %w", err)
+	}
+	if err := edgeRows.Close(); err != nil {
+		return fmt.Errorf("export graph edges: %w", err)
+	}
+	return nil
+}
+
 func (store *Store) FactCounts(ctx context.Context, snapshot storage.Snapshot) (storage.FactCounts, error) {
 	if snapshot.Workspace == "" || snapshot.Version == 0 {
 		return storage.FactCounts{}, fmt.Errorf("count graph facts: %w: snapshot is required", storage.ErrInvalidRequest)
 	}
+	return factCounts(ctx, store.database, snapshot)
+}
+
+type rowQueryer interface {
+	QueryRowContext(context.Context, string, ...any) *sql.Row
+}
+
+func factCounts(ctx context.Context, queries rowQueryer, snapshot storage.Snapshot) (storage.FactCounts, error) {
 	counts := storage.FactCounts{}
-	if err := store.database.QueryRowContext(ctx, `
+	if err := queries.QueryRowContext(ctx, `
 		SELECT COUNT(*) FROM (
 			SELECT node_id
 			FROM contribution_nodes
@@ -2210,7 +2623,7 @@ func (store *Store) FactCounts(ctx context.Context, snapshot storage.Snapshot) (
 		)`, snapshot.Workspace, snapshot.Version, snapshot.Version, snapshot.Workspace, snapshot.Version).Scan(&counts.Nodes); err != nil {
 		return storage.FactCounts{}, fmt.Errorf("count visible graph nodes: %w", err)
 	}
-	if err := store.database.QueryRowContext(ctx, `
+	if err := queries.QueryRowContext(ctx, `
 		SELECT COUNT(*) FROM (
 			SELECT source_id, target_id, relation
 			FROM contribution_edges
@@ -2282,10 +2695,7 @@ func (store *Store) Rollback(ctx context.Context, request storage.RollbackReques
 	if err := transaction.Commit(); err != nil {
 		return storage.Snapshot{}, fmt.Errorf("commit graph rollback: %w", err)
 	}
-	store.contributionMu.Lock()
-	delete(store.contributions, request.Workspace)
-	store.contributionMu.Unlock()
-	store.removeResolverProjections(request.Workspace, func(version storage.GraphVersion) bool {
+	store.invalidateWorkspaceCaches(request.Workspace, func(version storage.GraphVersion) bool {
 		return version > request.Version
 	})
 
@@ -2310,7 +2720,7 @@ func (store *Store) Prune(ctx context.Context, request storage.PruneRequest) (st
 	if err := transaction.Commit(); err != nil {
 		return storage.PruneResult{}, fmt.Errorf("commit graph version pruning: %w", err)
 	}
-	store.removeResolverProjections(request.Workspace, func(version storage.GraphVersion) bool {
+	store.invalidateWorkspaceCaches(request.Workspace, func(version storage.GraphVersion) bool {
 		return version < request.BeforeVersion
 	})
 
@@ -2396,6 +2806,24 @@ var contributionTables = []string{
 func closeContributionRecords(ctx context.Context, transaction *sql.Tx, workspace, sourcePath string, version int64) error {
 	for _, table := range contributionTables {
 		if _, err := transaction.ExecContext(ctx, "UPDATE "+table+" SET valid_to_version = ? WHERE workspace = ? AND source_path = ? AND valid_to_version IS NULL", version, workspace, sourcePath); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func closeContributionsMissingFromStagedSources(ctx context.Context, transaction *sql.Tx, workspace string, version storage.GraphVersion) error {
+	for _, table := range contributionTables {
+		if _, err := transaction.ExecContext(ctx, `UPDATE `+table+`
+			SET valid_to_version = ?
+			WHERE workspace = ? AND valid_to_version IS NULL
+				AND NOT EXISTS (
+					SELECT 1
+					FROM contribution_session_sources AS staged
+					WHERE staged.workspace = ?
+						AND staged.pending_version = ?
+						AND staged.source_path = `+table+`.source_path
+				)`, version-1, workspace, workspace, version); err != nil {
 			return err
 		}
 	}
@@ -2848,33 +3276,75 @@ func encodeContributions(update extractor.GraphUpdate) ([]encodedContribution, e
 	return encoded, nil
 }
 
-func storeWorkspaceFacts(ctx context.Context, transaction *sql.Tx, variableLimit int, workspace string, version storage.GraphVersion, facts graph.Facts, reportWriteMeasurement func(storage.PublishMeasurement)) error {
+func storeWorkspaceFacts(ctx context.Context, transaction *sql.Tx, variableLimit int, limits factBatchLimits, workspace string, version storage.GraphVersion, facts graph.Facts, reportWriteMeasurement func(storage.PublishMeasurement)) error {
 	nodesStarted := time.Now()
-	for start := 0; start < len(facts.Nodes); start += maximumBatchRows {
-		end := min(start+maximumBatchRows, len(facts.Nodes))
-		nodeRows := make([][]any, 0, end-start)
-		for _, node := range facts.Nodes[start:end] {
-			nodeRows = append(nodeRows, append([]any{workspace, version, node.ID, node.Kind, node.Label, node.QualifiedName}, evidenceValues(node.Evidence)...))
+	nodeRows := make([][]any, 0, limits.maximumRows)
+	nodeBytes := 0
+	for _, node := range facts.Nodes {
+		row := append([]any{workspace, version, node.ID, node.Kind, node.Label, node.QualifiedName}, evidenceValues(node.Evidence)...)
+		rowBytes := estimateRowsBytes([][]any{row})
+		if limits.maximumBytes > 0 && rowBytes > limits.maximumBytes {
+			return fmt.Errorf("store workspace nodes: workspace fact exceeds %d byte limit", limits.maximumBytes)
 		}
-		if err := insertRows(ctx, transaction, variableLimit, maximumBatchRows, "INSERT INTO workspace_nodes (workspace, version, node_id, kind, label, qualified_name, span_path, start_line, start_column, end_line, end_column, file_hash, extractor, provenance, confidence) VALUES ", nodeRows); err != nil {
+		if len(nodeRows) > 0 && (limits.maximumRows > 0 && len(nodeRows) >= limits.maximumRows || limits.maximumBytes > 0 && nodeBytes+rowBytes > limits.maximumBytes) {
+			if err := insertRows(ctx, transaction, variableLimit, maximumBatchRows, "INSERT OR IGNORE INTO workspace_nodes (workspace, version, node_id, kind, label, qualified_name, span_path, start_line, start_column, end_line, end_column, file_hash, extractor, provenance, confidence) VALUES ", nodeRows); err != nil {
+				return fmt.Errorf("store workspace nodes: %w", err)
+			}
+			nodeRows = nodeRows[:0]
+			nodeBytes = 0
+		}
+		nodeRows = append(nodeRows, row)
+		nodeBytes += rowBytes
+	}
+	if len(nodeRows) > 0 {
+		if err := insertRows(ctx, transaction, variableLimit, maximumBatchRows, "INSERT OR IGNORE INTO workspace_nodes (workspace, version, node_id, kind, label, qualified_name, span_path, start_line, start_column, end_line, end_column, file_hash, extractor, provenance, confidence) VALUES ", nodeRows); err != nil {
 			return fmt.Errorf("store workspace nodes: %w", err)
 		}
 	}
-	reportPublishMeasurement(reportWriteMeasurement, "workspace_nodes", time.Since(nodesStarted))
-	edgesStarted := time.Now()
-	for start := 0; start < len(facts.Edges); start += maximumBatchRows {
-		end := min(start+maximumBatchRows, len(facts.Edges))
-		edgeRows := make([][]any, 0, end-start)
-		for _, edge := range facts.Edges[start:end] {
-			row := append([]any{workspace, version, edge.SourceID, edge.TargetID, edge.Relation}, evidenceValues(edge.Evidence)...)
-			edgeRows = append(edgeRows, append(row, edge.Evidence.Span.Path))
+	if len(facts.Nodes) == 0 {
+		if reportWriteMeasurement != nil {
+			reportWriteMeasurement(storage.PublishMeasurement{Name: "workspace_nodes", NotApplicable: true})
 		}
+	} else {
+		reportPublishMeasurement(reportWriteMeasurement, "workspace_nodes", time.Since(nodesStarted))
+	}
+	edgesStarted := time.Now()
+	edgeRows := make([][]any, 0, limits.maximumRows)
+	edgeBytes := 0
+	for _, edge := range facts.Edges {
+		row := append([]any{workspace, version, edge.SourceID, edge.TargetID, edge.Relation}, evidenceValues(edge.Evidence)...)
+		row = append(row, edge.Evidence.Span.Path)
+		rowBytes := estimateRowsBytes([][]any{row})
+		if limits.maximumBytes > 0 && rowBytes > limits.maximumBytes {
+			return fmt.Errorf("store workspace edges: workspace fact exceeds %d byte limit", limits.maximumBytes)
+		}
+		if len(edgeRows) > 0 && (limits.maximumRows > 0 && len(edgeRows) >= limits.maximumRows || limits.maximumBytes > 0 && edgeBytes+rowBytes > limits.maximumBytes) {
+			if err := insertRows(ctx, transaction, variableLimit, maximumBatchRows, "INSERT OR IGNORE INTO workspace_edges (workspace, version, source_id, target_id, relation, span_path, start_line, start_column, end_line, end_column, file_hash, extractor, provenance, confidence, resolved_fact_owner) VALUES ", edgeRows); err != nil {
+				return fmt.Errorf("store workspace edges: %w", err)
+			}
+			edgeRows = edgeRows[:0]
+			edgeBytes = 0
+		}
+		edgeRows = append(edgeRows, row)
+		edgeBytes += rowBytes
+	}
+	if len(edgeRows) > 0 {
 		if err := insertRows(ctx, transaction, variableLimit, maximumBatchRows, "INSERT OR IGNORE INTO workspace_edges (workspace, version, source_id, target_id, relation, span_path, start_line, start_column, end_line, end_column, file_hash, extractor, provenance, confidence, resolved_fact_owner) VALUES ", edgeRows); err != nil {
 			return fmt.Errorf("store workspace edges: %w", err)
 		}
 	}
-	reportPublishMeasurement(reportWriteMeasurement, "workspace_edges", time.Since(edgesStarted))
+	if len(facts.Edges) == 0 {
+		if reportWriteMeasurement != nil {
+			reportWriteMeasurement(storage.PublishMeasurement{Name: "workspace_edges", NotApplicable: true})
+		}
+	} else {
+		reportPublishMeasurement(reportWriteMeasurement, "workspace_edges", time.Since(edgesStarted))
+	}
 	return nil
+}
+
+func estimateRowsBytes(rows [][]any) int {
+	return estimateContributionRowsBytes([][][]any{rows})
 }
 
 func evidenceValues(evidence graph.FactEvidence) []any {

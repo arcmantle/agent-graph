@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"runtime"
 	"strings"
 	"sync"
 	"testing"
@@ -25,12 +26,26 @@ import (
 
 type contributionSessionStore struct {
 	*sqlite.Store
-	sessions      int
-	contributions int
-	writeStarted  chan struct{}
-	releaseWrites chan struct{}
-	writeError    error
-	writeOnce     sync.Once
+	observationMu           sync.Mutex
+	sessions                int
+	contributions           int
+	stagedSources           int
+	stagedAtFirstWrite      int
+	resolverProjectionPages int
+	resolverProjectionError error
+	resolverTargetError     error
+	resolverPackageError    error
+	dependencyWriteError    error
+	workspaceFactPages      int
+	workspaceFactNodes      int
+	workspaceFactEdges      int
+	workspaceFactFailAfter  int
+	workspaceFactWriteError error
+	writeStarted            chan struct{}
+	releaseWrites           chan struct{}
+	writeError              error
+	writeOnce               sync.Once
+	sealed                  bool
 }
 
 func (store *contributionSessionStore) Publish(context.Context, storage.PublishRequest) (storage.Snapshot, error) {
@@ -51,7 +66,22 @@ type contributionSessionObserver struct {
 	store *contributionSessionStore
 }
 
+func (observer contributionSessionObserver) StageSource(ctx context.Context, sourcePath string) error {
+	if err := observer.ContributionSession.StageSource(ctx, sourcePath); err != nil {
+		return err
+	}
+	observer.store.observationMu.Lock()
+	observer.store.stagedSources++
+	observer.store.observationMu.Unlock()
+	return nil
+}
+
 func (observer contributionSessionObserver) WriteContribution(ctx context.Context, contribution extractor.Contribution) error {
+	observer.store.observationMu.Lock()
+	if observer.store.contributions == 0 {
+		observer.store.stagedAtFirstWrite = observer.store.stagedSources
+	}
+	observer.store.observationMu.Unlock()
 	if observer.store.writeError != nil {
 		return observer.store.writeError
 	}
@@ -66,6 +96,59 @@ func (observer contributionSessionObserver) WriteContribution(ctx context.Contex
 	}
 	observer.store.contributions++
 	return nil
+}
+
+func (observer contributionSessionObserver) SealContributions(ctx context.Context) error {
+	if err := observer.ContributionSession.SealContributions(ctx); err != nil {
+		return err
+	}
+	observer.store.sealed = true
+	return nil
+}
+
+func (observer contributionSessionObserver) ReplaceContributionDependencies(ctx context.Context, contributions []extractor.Contribution) error {
+	if !observer.store.sealed {
+		return errors.New("replace contribution dependencies before seal")
+	}
+	if observer.store.dependencyWriteError != nil {
+		return observer.store.dependencyWriteError
+	}
+	return observer.ContributionSession.ReplaceContributionDependencies(ctx, contributions)
+}
+
+func (observer contributionSessionObserver) WriteWorkspaceFacts(ctx context.Context, facts graph.Facts) error {
+	if observer.store.workspaceFactWriteError != nil && observer.store.workspaceFactPages >= observer.store.workspaceFactFailAfter {
+		return observer.store.workspaceFactWriteError
+	}
+	if err := observer.ContributionSession.WriteWorkspaceFacts(ctx, facts); err != nil {
+		return err
+	}
+	observer.store.workspaceFactPages++
+	observer.store.workspaceFactNodes += len(facts.Nodes)
+	observer.store.workspaceFactEdges += len(facts.Edges)
+	return nil
+}
+
+func (observer contributionSessionObserver) ResolverProjectionPage(ctx context.Context, snapshot storage.Snapshot, request storage.ResolverProjectionPageRequest) ([]storage.ResolverProjection, error) {
+	observer.store.resolverProjectionPages++
+	if observer.store.resolverProjectionError != nil {
+		return nil, observer.store.resolverProjectionError
+	}
+	return observer.ContributionSession.ResolverProjectionPage(ctx, snapshot, request)
+}
+
+func (observer contributionSessionObserver) ResolverTarget(ctx context.Context, snapshot storage.Snapshot, request extractor.ResolverTargetRequest) (extractor.ResolverTarget, bool, error) {
+	if observer.store.resolverTargetError != nil {
+		return extractor.ResolverTarget{}, false, observer.store.resolverTargetError
+	}
+	return observer.ContributionSession.ResolverTarget(ctx, snapshot, request)
+}
+
+func (observer contributionSessionObserver) ResolverPackagePage(ctx context.Context, snapshot storage.Snapshot, request extractor.ResolverPackagePageRequest) ([]extractor.ResolverTarget, error) {
+	if observer.store.resolverPackageError != nil {
+		return nil, observer.store.resolverPackageError
+	}
+	return observer.ContributionSession.ResolverPackagePage(ctx, snapshot, request)
 }
 
 func TestPublishCreatesInitialWorkspaceGraph(t *testing.T) {
@@ -122,12 +205,308 @@ func TestIndexPublishesInitialWorkspaceThroughContributionSession(t *testing.T) 
 	if store.sessions != 1 || store.contributions != 2 {
 		t.Errorf("contribution session activity = %d sessions, %d contributions, want 1 session and 2 contributions", store.sessions, store.contributions)
 	}
+	if store.resolverProjectionPages == 0 {
+		t.Error("initial index did not read staged resolver projection pages")
+	}
+	if store.workspaceFactPages == 0 {
+		t.Error("initial index did not stream resolved workspace fact pages")
+	}
+	if store.workspaceFactNodes != 0 || store.workspaceFactEdges == 0 {
+		t.Errorf("streamed workspace facts = %d nodes and %d edges, want no duplicate contribution nodes and positive resolved edges", store.workspaceFactNodes, store.workspaceFactEdges)
+	}
 	collector := &factCollector{}
 	if err := store.Export(context.Background(), result.Snapshot, storage.ExportRequest{}, collector); err != nil {
 		t.Fatalf("export indexed graph: %v", err)
 	}
-	if !hasImportTargetFrom(collector, "src/main.ts", "src/helper.ts::helper") {
+	if !hasImportTargetFrom(collector, "src/main.ts", "src/helper.ts::helper", "typescript:imports_from") {
 		t.Errorf("indexed graph does not contain the resolved TypeScript import: %+v", collector.edges)
+	}
+}
+
+func TestIndexTypeScriptProjectionPagesResolveAcrossBoundary(t *testing.T) {
+	files := map[string]string{
+		"package.json":    `{"name":"fixture"}`,
+		"src/a-target.ts": "export function target() { return 1; }",
+		"src/z-main.ts":   "import { target } from './a-target'; export function main() { return target(); }",
+	}
+	for sourceIndex := 0; sourceIndex < resolverPageTestSourceCount-2; sourceIndex++ {
+		files[fmt.Sprintf("src/m-filler-%03d.ts", sourceIndex)] = fmt.Sprintf("export const value%d = %d;", sourceIndex, sourceIndex)
+	}
+	workspace := testkit.NewWorkspace(t, files)
+	store, err := sqlite.Open(context.Background(), filepath.Join(t.TempDir(), "graph.db"))
+	if err != nil {
+		t.Fatalf("open graph store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	snapshot, err := index.Publish(context.Background(), store, index.Request{Root: workspace.Root})
+	if err != nil {
+		t.Fatalf("publish paged initial workspace: %v", err)
+	}
+	collector := &factCollector{}
+	if err := store.Export(context.Background(), snapshot, storage.ExportRequest{}, collector); err != nil {
+		t.Fatalf("export paged initial workspace: %v", err)
+	}
+	if !hasImportTargetFrom(collector, "src/z-main.ts", "src/a-target.ts::target", "typescript:imports_from") {
+		t.Error("paged initial graph does not contain the cross-page TypeScript import")
+	}
+	contributions, err := store.SourceContributions(context.Background(), snapshot)
+	if err != nil {
+		t.Fatalf("read paged initial contributions: %v", err)
+	}
+	for _, contribution := range contributions {
+		if contribution.SourcePath != "src/z-main.ts" {
+			continue
+		}
+		if !reflect.DeepEqual(contribution.Dependencies, []extractor.Dependency{{SourcePath: "src/z-main.ts", TargetPath: "src/a-target.ts"}}) {
+			t.Errorf("src/z-main.ts dependencies = %+v, want src/a-target.ts", contribution.Dependencies)
+		}
+		return
+	}
+	t.Error("src/z-main.ts contribution was not stored")
+}
+
+func TestIndexJavaScriptResolvesFromStagedProjectionPages(t *testing.T) {
+	workspace := testkit.NewWorkspace(t, map[string]string{
+		"package.json":  `{"name":"fixture"}`,
+		"src/helper.js": "export function helper() { return 1; }",
+		"src/main.js":   "import { helper } from './helper'; export function main() { return helper(); }",
+	})
+	store, err := sqlite.Open(context.Background(), filepath.Join(t.TempDir(), "graph.db"))
+	if err != nil {
+		t.Fatalf("open graph store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	snapshot, err := index.Publish(context.Background(), store, index.Request{Root: workspace.Root})
+	if err != nil {
+		t.Fatalf("publish JavaScript workspace: %v", err)
+	}
+	collector := &factCollector{}
+	if err := store.Export(context.Background(), snapshot, storage.ExportRequest{}, collector); err != nil {
+		t.Fatalf("export JavaScript workspace: %v", err)
+	}
+	if !hasImportTargetFrom(collector, "src/main.js", "src/helper.js::helper", "javascript:imports_from") {
+		t.Error("initial JavaScript graph does not contain the resolved import")
+	}
+}
+
+func TestIndexProjectionPageFailureKeepsPriorSnapshotCurrent(t *testing.T) {
+	workspace := testkit.NewWorkspace(t, map[string]string{
+		"package.json":  `{"name":"fixture"}`,
+		"src/helper.ts": "export function helper() { return 1; }",
+		"src/main.ts":   "import { helper } from './helper'; export function main() { return helper(); }",
+	})
+	baseStore, err := sqlite.Open(context.Background(), filepath.Join(t.TempDir(), "graph.db"))
+	if err != nil {
+		t.Fatalf("open graph store: %v", err)
+	}
+	t.Cleanup(func() { _ = baseStore.Close() })
+	prior, err := index.Publish(context.Background(), baseStore, index.Request{Root: workspace.Root})
+	if err != nil {
+		t.Fatalf("publish prior workspace: %v", err)
+	}
+
+	projectionError := errors.New("injected projection failure")
+	_, err = index.Publish(context.Background(), &contributionSessionStore{
+		Store:                   baseStore,
+		resolverProjectionError: projectionError,
+	}, index.Request{Root: workspace.Root})
+	if !errors.Is(err, projectionError) {
+		t.Fatalf("publish with projection failure = %v, want injected failure", err)
+	}
+	current, err := baseStore.OpenSnapshot(context.Background(), storage.OpenSnapshotRequest{Workspace: workspace.Root})
+	if err != nil {
+		t.Fatalf("open snapshot after projection failure: %v", err)
+	}
+	if current != prior {
+		t.Errorf("snapshot after projection failure = %+v, want prior %+v", current, prior)
+	}
+}
+
+func TestIndexWorkspaceFactPageFailureKeepsPriorSnapshotCurrent(t *testing.T) {
+	files := map[string]string{
+		"package.json":    `{"name":"fixture"}`,
+		"src/a-target.ts": "export function target() { return 1; }",
+		"src/z-main.ts":   "import { target } from './a-target'; export function main() { return target(); }",
+	}
+	for sourceIndex := 0; sourceIndex < resolverPageTestSourceCount-2; sourceIndex++ {
+		files[fmt.Sprintf("src/m-filler-%03d.ts", sourceIndex)] = fmt.Sprintf("export const value%d = %d;", sourceIndex, sourceIndex)
+	}
+	workspace := testkit.NewWorkspace(t, files)
+	baseStore, err := sqlite.Open(context.Background(), filepath.Join(t.TempDir(), "graph.db"))
+	if err != nil {
+		t.Fatalf("open graph store: %v", err)
+	}
+	t.Cleanup(func() { _ = baseStore.Close() })
+	prior, err := index.Publish(context.Background(), baseStore, index.Request{Root: workspace.Root})
+	if err != nil {
+		t.Fatalf("publish prior workspace: %v", err)
+	}
+
+	writeError := errors.New("injected workspace fact page failure")
+	store := &contributionSessionStore{
+		Store:                   baseStore,
+		workspaceFactFailAfter:  1,
+		workspaceFactWriteError: writeError,
+	}
+	_, err = index.Publish(context.Background(), store, index.Request{Root: workspace.Root})
+	if !errors.Is(err, writeError) {
+		t.Fatalf("publish with workspace fact failure = %v, want injected failure", err)
+	}
+	if store.workspaceFactPages != 1 {
+		t.Fatalf("workspace fact pages before failure = %d, want 1", store.workspaceFactPages)
+	}
+	current, err := baseStore.OpenSnapshot(context.Background(), storage.OpenSnapshotRequest{Workspace: workspace.Root})
+	if err != nil {
+		t.Fatalf("open snapshot after workspace fact failure: %v", err)
+	}
+	if current != prior {
+		t.Errorf("snapshot after workspace fact failure = %+v, want prior %+v", current, prior)
+	}
+}
+
+func TestIndexResolutionSessionFailureKeepsPriorSnapshotCurrent(t *testing.T) {
+	testCases := []struct {
+		name            string
+		files           map[string]string
+		configuredRoots []string
+		configure       func(*contributionSessionStore, error)
+	}{
+		{
+			name: "resolver target",
+			files: map[string]string{
+				"package.json":  `{"name":"fixture"}`,
+				"src/helper.ts": "export function helper() { return 1; }",
+				"src/main.ts":   "import { helper } from './helper'; export function main() { return helper(); }",
+			},
+			configure: func(store *contributionSessionStore, failure error) { store.resolverTargetError = failure },
+		},
+		{
+			name: "resolver package",
+			files: map[string]string{
+				"go.mod":                    "module example.com/fixture\n",
+				"internal/helper/helper.go": "package helper\n\nfunc Help() {}\n",
+				"cmd/main.go":               "package main\n\nimport \"example.com/fixture/internal/helper\"\n\nfunc Main() { helper.Help() }\n",
+			},
+			configuredRoots: []string{"."},
+			configure:       func(store *contributionSessionStore, failure error) { store.resolverPackageError = failure },
+		},
+		{
+			name: "dependency write",
+			files: map[string]string{
+				"package.json": `{"name":"fixture"}`,
+				"src/main.ts":  "export function main() { return 1; }",
+			},
+			configure: func(store *contributionSessionStore, failure error) { store.dependencyWriteError = failure },
+		},
+	}
+	for _, testCase := range testCases {
+		t.Run(testCase.name, func(t *testing.T) {
+			workspace := testkit.NewWorkspace(t, testCase.files)
+			baseStore, err := sqlite.Open(context.Background(), filepath.Join(t.TempDir(), "graph.db"))
+			if err != nil {
+				t.Fatalf("open graph store: %v", err)
+			}
+			t.Cleanup(func() { _ = baseStore.Close() })
+			request := index.Request{Root: workspace.Root, ConfiguredRoots: testCase.configuredRoots}
+			prior, err := index.Publish(context.Background(), baseStore, request)
+			if err != nil {
+				t.Fatalf("publish prior workspace: %v", err)
+			}
+
+			failure := errors.New("injected " + testCase.name + " failure")
+			store := &contributionSessionStore{Store: baseStore}
+			testCase.configure(store, failure)
+			_, err = index.Publish(context.Background(), store, request)
+			if !errors.Is(err, failure) {
+				t.Fatalf("publish with %s failure = %v, want injected failure", testCase.name, err)
+			}
+			current, err := baseStore.OpenSnapshot(context.Background(), storage.OpenSnapshotRequest{Workspace: workspace.Root})
+			if err != nil {
+				t.Fatalf("open snapshot after %s failure: %v", testCase.name, err)
+			}
+			if current != prior {
+				t.Errorf("snapshot after %s failure = %+v, want prior %+v", testCase.name, current, prior)
+			}
+		})
+	}
+}
+
+func TestIndexFullReplacementRemovesDeletedSourceAndKeepsPriorSnapshot(t *testing.T) {
+	workspace := testkit.NewWorkspace(t, map[string]string{
+		"package.json":  `{"name":"fixture"}`,
+		"src/helper.ts": "import { main } from './main'; export function helper() { return main(); }",
+		"src/main.ts":   "export function main() { return 2; }",
+	})
+	store, err := sqlite.Open(context.Background(), filepath.Join(t.TempDir(), "graph.db"))
+	if err != nil {
+		t.Fatalf("open graph store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	prior, err := index.Publish(context.Background(), store, index.Request{Root: workspace.Root})
+	if err != nil {
+		t.Fatalf("publish initial workspace: %v", err)
+	}
+	workspace.RemoveFile(t, "src/helper.ts")
+	current, err := index.Publish(context.Background(), store, index.Request{Root: workspace.Root})
+	if err != nil {
+		t.Fatalf("publish replacement workspace: %v", err)
+	}
+
+	priorContributions, err := store.SourceContributions(context.Background(), prior)
+	if err != nil {
+		t.Fatalf("read prior contributions: %v", err)
+	}
+	if len(priorContributions) != 2 {
+		t.Errorf("prior contributions = %d, want 2", len(priorContributions))
+	}
+	currentContributions, err := store.SourceContributions(context.Background(), current)
+	if err != nil {
+		t.Fatalf("read replacement contributions: %v", err)
+	}
+	if len(currentContributions) != 1 || currentContributions[0].SourcePath != "src/main.ts" {
+		t.Errorf("replacement contributions = %+v, want only src/main.ts", currentContributions)
+	}
+	collector := &factCollector{}
+	if err := store.Export(context.Background(), current, storage.ExportRequest{}, collector); err != nil {
+		t.Fatalf("export replacement graph: %v", err)
+	}
+	if hasImport(collector.edges, "src/helper.ts") {
+		t.Errorf("replacement graph retains an import owned by deleted src/helper.ts: %+v", collector.edges)
+	}
+}
+
+func TestIndexFullReplacementPublishesDeletionOnlySnapshot(t *testing.T) {
+	workspace := testkit.NewWorkspace(t, map[string]string{
+		"package.json": `{"name":"fixture"}`,
+		"src/main.ts":  "export function main() { return 1; }",
+	})
+	store, err := sqlite.Open(context.Background(), filepath.Join(t.TempDir(), "graph.db"))
+	if err != nil {
+		t.Fatalf("open graph store: %v", err)
+	}
+	t.Cleanup(func() { _ = store.Close() })
+
+	prior, err := index.Publish(context.Background(), store, index.Request{Root: workspace.Root})
+	if err != nil {
+		t.Fatalf("publish initial workspace: %v", err)
+	}
+	workspace.RemoveFile(t, "src/main.ts")
+	current, err := index.Publish(context.Background(), store, index.Request{Root: workspace.Root})
+	if err != nil {
+		t.Fatalf("publish deletion-only workspace: %v", err)
+	}
+	if current.Version != prior.Version+1 {
+		t.Errorf("deletion-only version = %d, want %d", current.Version, prior.Version+1)
+	}
+	contributions, err := store.SourceContributions(context.Background(), current)
+	if err != nil {
+		t.Fatalf("read deletion-only contributions: %v", err)
+	}
+	if len(contributions) != 0 {
+		t.Errorf("deletion-only contributions = %+v, want none", contributions)
 	}
 }
 
@@ -186,6 +565,38 @@ readProgress:
 	}
 	if err := <-indexed; err != nil {
 		t.Fatalf("index workspace: %v", err)
+	}
+}
+
+func TestIndexStreamsDiscoveredSourcesBeforeDiscoveryCompletes(t *testing.T) {
+	previousProcs := runtime.GOMAXPROCS(1)
+	t.Cleanup(func() { runtime.GOMAXPROCS(previousProcs) })
+
+	const sourceCount = 64
+	files := map[string]string{"package.json": `{"name":"fixture"}`}
+	for sourceIndex := range sourceCount {
+		files[fmt.Sprintf("src/source-%03d.ts", sourceIndex)] = fmt.Sprintf("export const value%d = %d;", sourceIndex, sourceIndex)
+	}
+	workspace := testkit.NewWorkspace(t, files)
+	baseStore, err := sqlite.Open(context.Background(), filepath.Join(t.TempDir(), "graph.db"))
+	if err != nil {
+		t.Fatalf("open graph store: %v", err)
+	}
+	t.Cleanup(func() { _ = baseStore.Close() })
+	store := &contributionSessionStore{Store: baseStore}
+
+	if _, err := index.Index(context.Background(), store, index.Request{Root: workspace.Root}); err != nil {
+		t.Fatalf("index workspace: %v", err)
+	}
+	store.observationMu.Lock()
+	stagedAtFirstWrite := store.stagedAtFirstWrite
+	stagedSources := store.stagedSources
+	store.observationMu.Unlock()
+	if stagedSources != sourceCount {
+		t.Errorf("staged sources = %d, want %d", stagedSources, sourceCount)
+	}
+	if stagedAtFirstWrite >= sourceCount {
+		t.Errorf("sources staged at first write = %d, want fewer than %d", stagedAtFirstWrite, sourceCount)
 	}
 }
 
@@ -289,29 +700,44 @@ func TestIndexReportsExtractionResolutionAndPublicationProgress(t *testing.T) {
 	})
 
 	progress := make([]index.Progress, 0)
-	if _, err := index.Index(context.Background(), store, index.Request{
+	result, err := index.Index(context.Background(), store, index.Request{
 		Root: workspace.Root,
 		Progress: func(update index.Progress) {
 			progress = append(progress, update)
 		},
-	}); err != nil {
+	})
+	if err != nil {
 		t.Fatalf("index workspace: %v", err)
 	}
 
-	if len(progress) < 5 {
+	if len(progress) < 6 {
 		t.Fatalf("progress = %+v, want extraction, resolution, and publication updates", progress)
 	}
-	if progress[0] != (index.Progress{Phase: index.ExtractPhase, TotalSources: 2}) {
-		t.Errorf("initial progress = %+v, want extraction total", progress[0])
+	if progress[0] != (index.Progress{Phase: index.ExtractPhase}) {
+		t.Errorf("initial progress = %+v, want extraction with total pending", progress[0])
 	}
-	if progress[2] != (index.Progress{Phase: index.ExtractPhase, CompletedSources: 2, TotalSources: 2}) {
-		t.Errorf("final extraction progress = %+v, want two completed sources", progress[2])
+	if progress[3] != (index.Progress{Phase: index.ExtractPhase, CompletedSources: 2, TotalSources: 2}) {
+		t.Errorf("final extraction progress = %+v, want two completed sources", progress[3])
 	}
-	if progress[3] != (index.Progress{Phase: index.ResolvePhase, CompletedSources: 2, TotalSources: 2}) {
-		t.Errorf("resolution progress = %+v, want resolved workspace", progress[3])
+	if progress[4] != (index.Progress{Phase: index.ResolvePhase, CompletedSources: 2, TotalSources: 2}) {
+		t.Errorf("resolution progress = %+v, want resolved workspace", progress[4])
 	}
-	if progress[4] != (index.Progress{Phase: index.PublishPhase, CompletedSources: 2, TotalSources: 2}) {
-		t.Errorf("publication progress = %+v, want published workspace", progress[4])
+	publication := progress[len(progress)-1]
+	if publication.Phase != index.PublishPhase || publication.CompletedSources != 2 || publication.TotalSources != 2 {
+		t.Errorf("publication progress = %+v, want two published sources", publication)
+	}
+	if publication.TotalNodes == 0 || publication.TotalEdges == 0 {
+		t.Errorf("publication progress = %+v, want positive fact totals", publication)
+	}
+	if publication.WrittenNodes != publication.TotalNodes || publication.WrittenEdges != publication.TotalEdges {
+		t.Errorf("publication progress = %+v, want all facts written", publication)
+	}
+	counts, err := store.FactCounts(context.Background(), result.Snapshot)
+	if err != nil {
+		t.Fatalf("count published facts: %v", err)
+	}
+	if publication.TotalNodes != counts.Nodes || publication.TotalEdges != counts.Edges {
+		t.Errorf("publication totals = %d nodes and %d edges, want committed counts %+v", publication.TotalNodes, publication.TotalEdges, counts)
 	}
 }
 
@@ -330,17 +756,21 @@ func TestIndexReportsStablePhaseMeasurements(t *testing.T) {
 		}
 	})
 
-	measurements := make([]index.Measurement, 0, 5)
+	measurements := make([]index.Measurement, 0, 12)
+	var statistics index.PipelineStatistics
 	if _, err := index.Index(context.Background(), store, index.Request{
 		Root: workspace.Root,
 		Measurement: func(measurement index.Measurement) {
 			measurements = append(measurements, measurement)
 		},
+		PipelineStatistics: func(update index.PipelineStatistics) {
+			statistics = update
+		},
 	}); err != nil {
 		t.Fatalf("index workspace: %v", err)
 	}
 
-	wantNames := []string{"extraction", "extraction_write_overlap", "resolution", "publication_preparation", "sqlite_write", "commit", "staged_transaction"}
+	wantNames := []string{"discovery", "pipeline_wall", "extraction", "extractor_busy", "writer_busy", "producer_blocked", "extraction_write_overlap", "resolution", "publication_preparation", "sqlite_write", "commit", "staged_transaction"}
 	if len(measurements) != len(wantNames) {
 		t.Fatalf("measurements = %+v, want %d phases", measurements, len(wantNames))
 	}
@@ -351,6 +781,12 @@ func TestIndexReportsStablePhaseMeasurements(t *testing.T) {
 		if measurements[measurementIndex].Duration < 0 {
 			t.Errorf("measurement %q duration = %s, want non-negative", want, measurements[measurementIndex].Duration)
 		}
+	}
+	if statistics.ContributionQueueHighWater <= 0 {
+		t.Errorf("contribution queue high-water = %d, want positive", statistics.ContributionQueueHighWater)
+	}
+	if statistics.ContributionQueueHighWater > statistics.ContributionQueueCapacity {
+		t.Errorf("contribution queue high-water = %d, want at most capacity %d", statistics.ContributionQueueHighWater, statistics.ContributionQueueCapacity)
 	}
 }
 
@@ -385,7 +821,7 @@ func TestPublishBatchReportsStableResolverMeasurements(t *testing.T) {
 		t.Fatalf("publish changed source batch: %v", err)
 	}
 
-	wantNames := []string{"affected_source_selection", "contribution_restoration", "workspace_resolution"}
+	wantNames := []string{"affected_source_selection", "contribution_restoration", "workspace_resolution", "publication_preparation", "sqlite_write", "commit"}
 	if len(measurements) != len(wantNames) {
 		t.Fatalf("measurements = %+v, want %d resolver measurements", measurements, len(wantNames))
 	}
@@ -552,7 +988,7 @@ func TestPublishBatchReresolvesOnlyDependenciesInTheChangedProject(t *testing.T)
 		"packages/first/src/main.ts":  "packages/first/src/helper.ts::helper",
 		"packages/second/src/main.ts": "packages/second/src/helper.ts::helper",
 	} {
-		if !hasImportTargetFrom(initialFacts, sourcePath, qualifiedName) {
+		if !hasImportTargetFrom(initialFacts, sourcePath, qualifiedName, "typescript:imports_from") {
 			t.Errorf("initial graph has no named import from %q to %q", sourcePath, qualifiedName)
 		}
 	}
@@ -573,10 +1009,10 @@ func TestPublishBatchReresolvesOnlyDependenciesInTheChangedProject(t *testing.T)
 	if err := store.Export(context.Background(), second, storage.ExportRequest{}, updatedFacts); err != nil {
 		t.Fatalf("export changed multi-project graph: %v", err)
 	}
-	if hasImportTargetFrom(updatedFacts, "packages/first/src/main.ts", "packages/first/src/helper.ts::helper") {
+	if hasImportTargetFrom(updatedFacts, "packages/first/src/main.ts", "packages/first/src/helper.ts::helper", "typescript:imports_from") {
 		t.Error("changed project retains a named import for its removed exported surface")
 	}
-	if !hasImportTargetFrom(updatedFacts, "packages/second/src/main.ts", "packages/second/src/helper.ts::helper") {
+	if !hasImportTargetFrom(updatedFacts, "packages/second/src/main.ts", "packages/second/src/helper.ts::helper", "typescript:imports_from") {
 		t.Error("unchanged project loses its named import target")
 	}
 }
@@ -741,10 +1177,19 @@ func TestPublishBatchTypeScriptPagesMatchFreshUnpagedIndex(t *testing.T) {
 	if _, err := index.Publish(context.Background(), boundedStore, index.Request{Root: workspace.Root}); err != nil {
 		t.Fatalf("publish initial workspace graph: %v", err)
 	}
-	workspace.WriteFile(t, fmt.Sprintf("src/file-%03d.ts", resolverPageTestSourceCount), fmt.Sprintf("export const replacement%d = %d;", resolverPageTestSourceCount, resolverPageTestSourceCount))
+	changedPaths := make([]string, 0, resolverPageTestSourceCount+1)
+	for sourceIndex := 0; sourceIndex <= resolverPageTestSourceCount; sourceIndex++ {
+		changedPath := fmt.Sprintf("src/file-%03d.ts", sourceIndex)
+		workspace.WriteFile(t, changedPath, fmt.Sprintf("export const replacement%d = %d;", sourceIndex, sourceIndex))
+		changedPaths = append(changedPaths, changedPath)
+	}
+	measurements := make([]index.Measurement, 0, 6)
 	boundedSnapshot, err := index.PublishBatch(context.Background(), rejectingContributionReader{Store: boundedStore}, index.BatchRequest{
 		Root:         workspace.Root,
-		ChangedPaths: []string{fmt.Sprintf("src/file-%03d.ts", resolverPageTestSourceCount)},
+		ChangedPaths: changedPaths,
+		Measurement: func(measurement index.Measurement) {
+			measurements = append(measurements, measurement)
+		},
 	})
 	if err != nil {
 		t.Fatalf("publish bounded TypeScript batch: %v", err)
@@ -770,6 +1215,15 @@ func TestPublishBatchTypeScriptPagesMatchFreshUnpagedIndex(t *testing.T) {
 	}
 	if !reflect.DeepEqual(bounded.nodes, fresh.nodes) || !reflect.DeepEqual(bounded.edges, fresh.edges) {
 		t.Errorf("bounded facts differ from fresh facts\nbounded: %+v\nfresh: %+v", bounded, fresh)
+	}
+	wantMeasurements := []string{"affected_source_selection", "contribution_restoration", "workspace_resolution", "publication_preparation", "sqlite_write", "commit"}
+	if len(measurements) != len(wantMeasurements) {
+		t.Fatalf("staged measurements = %+v, want %q", measurements, wantMeasurements)
+	}
+	for measurementIndex, want := range wantMeasurements {
+		if measurements[measurementIndex].Name != want {
+			t.Errorf("staged measurement %d = %q, want %q", measurementIndex, measurements[measurementIndex].Name, want)
+		}
 	}
 }
 
@@ -1284,7 +1738,7 @@ func hasProjectSource(facts *factCollector, projectID, sourcePath string) bool {
 	return false
 }
 
-func hasImportTargetFrom(facts *factCollector, sourcePath, qualifiedName string) bool {
+func hasImportTargetFrom(facts *factCollector, sourcePath, qualifiedName string, relation graph.RelationKind) bool {
 	var sourceID string
 	for _, node := range facts.nodes {
 		if node.QualifiedName == sourcePath {
@@ -1297,7 +1751,7 @@ func hasImportTargetFrom(facts *factCollector, sourcePath, qualifiedName string)
 			continue
 		}
 		for _, edge := range facts.edges {
-			if edge.SourceID == sourceID && edge.TargetID == node.ID && edge.Relation == "typescript:imports_from" {
+			if edge.SourceID == sourceID && edge.TargetID == node.ID && edge.Relation == relation {
 				return true
 			}
 		}
