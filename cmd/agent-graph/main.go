@@ -17,7 +17,6 @@ import (
 	"strconv"
 	"strings"
 	"sync"
-	"syscall"
 	"time"
 
 	"agent-graph/benchmark"
@@ -867,7 +866,7 @@ func measureBenchmarkRun(workspace, stateDirectory string, corpus benchmark.Corp
 		}
 		if err == nil {
 			snapshot = result.Snapshot
-			initialIndexPeakRSS = peakRSSBytes()
+			initialIndexPeakRSS = benchmark.PeakRSSBytes()
 		}
 		return err
 	}
@@ -1031,17 +1030,6 @@ func graphChecksum(ctx context.Context, store storage.Exporter, snapshot storage
 		return "", fmt.Errorf("checksum benchmark graph: %w", err)
 	}
 	return fmt.Sprintf("sha256:%x", sum.Sum(nil)), nil
-}
-
-func peakRSSBytes() uint64 {
-	var usage syscall.Rusage
-	if err := syscall.Getrusage(syscall.RUSAGE_SELF, &usage); err != nil || usage.Maxrss <= 0 {
-		return 0
-	}
-	if runtime.GOOS == "darwin" {
-		return uint64(usage.Maxrss)
-	}
-	return uint64(usage.Maxrss) * 1024
 }
 
 func retainedHeapBytes() uint64 {
