@@ -7,7 +7,6 @@ import (
 	"io"
 	"os"
 	"path/filepath"
-	"syscall"
 )
 
 const (
@@ -44,8 +43,8 @@ func Acquire(root string) (*Owner, error) {
 	if err != nil {
 		return nil, fmt.Errorf("open workspace indexer lock: %w", err)
 	}
-	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
-		if errors.Is(err, syscall.EWOULDBLOCK) {
+	if err := lockFile(lock); err != nil {
+		if isLockBlocked(err) {
 			metadata := ownerMetadata{Endpoint: endpoint}
 			if decodeErr := json.NewDecoder(lock).Decode(&metadata); decodeErr != nil && !errors.Is(decodeErr, io.EOF) {
 				_ = lock.Close()
@@ -60,22 +59,22 @@ func Acquire(root string) (*Owner, error) {
 
 	metadata, err := json.Marshal(ownerMetadata{Endpoint: endpoint})
 	if err != nil {
-		_ = syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+		_ = unlockFile(lock)
 		_ = lock.Close()
 		return nil, fmt.Errorf("encode workspace indexer identity: %w", err)
 	}
 	if err := lock.Truncate(0); err != nil {
-		_ = syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+		_ = unlockFile(lock)
 		_ = lock.Close()
 		return nil, fmt.Errorf("clear workspace indexer identity: %w", err)
 	}
 	if _, err := lock.Seek(0, 0); err != nil {
-		_ = syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+		_ = unlockFile(lock)
 		_ = lock.Close()
 		return nil, fmt.Errorf("seek workspace indexer identity: %w", err)
 	}
 	if _, err := lock.Write(metadata); err != nil {
-		_ = syscall.Flock(int(lock.Fd()), syscall.LOCK_UN)
+		_ = unlockFile(lock)
 		_ = lock.Close()
 		return nil, fmt.Errorf("write workspace indexer identity: %w", err)
 	}
@@ -90,7 +89,7 @@ func (owner *Owner) Close() error {
 	if owner == nil || owner.lock == nil {
 		return nil
 	}
-	if err := syscall.Flock(int(owner.lock.Fd()), syscall.LOCK_UN); err != nil {
+	if err := unlockFile(owner.lock); err != nil {
 		return fmt.Errorf("unlock workspace indexer: %w", err)
 	}
 	err := owner.lock.Close()

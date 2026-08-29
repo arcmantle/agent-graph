@@ -19,4 +19,5 @@ require (
 require (
 	github.com/mattn/go-pointer v0.0.1 // indirect
 	github.com/mattn/go-sqlite3 v1.14.24
+	golang.org/x/sys v0.35.0
 )
