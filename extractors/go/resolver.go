@@ -135,6 +135,7 @@ func ResolvePage(ctx context.Context, contributions []extractor.Contribution, pr
 	if projectID == "" || index == nil {
 		return Resolution{}, fmt.Errorf("resolve Go page: project and resolver index are required")
 	}
+	index = extractor.NewPageResolverIndex(index)
 	modulePath, _ := modulePath(view)
 	files := make(map[string]graph.Node, len(contributions))
 	byPath := make(map[string]extractor.Contribution, len(contributions))

@@ -197,6 +197,55 @@ func TestExtractProvidesConstantDynamicImportForResolution(t *testing.T) {
 	}
 }
 
+func TestExtractAcceptsTypeQueryInCallTypeArguments(t *testing.T) {
+	_, err := Extract(extractor.Source{
+		ProjectID:  "project:fixture",
+		SourcePath: "src/filter-controller.spec.ts",
+		Contents:   []byte("const actual = await importOriginal<typeof import('./convert-url.ts')>();"),
+	})
+	if err != nil {
+		t.Fatalf("extract valid TypeScript type-query call: %v", err)
+	}
+}
+
+func TestExtractAcceptsTypeQueryOutsideCallTypeArguments(t *testing.T) {
+	_, err := Extract(extractor.Source{
+		ProjectID:  "project:fixture",
+		SourcePath: "src/module.ts",
+		Contents:   []byte("const module: typeof import('./module.ts') = {} as typeof import('./module.ts');"),
+	})
+	if err != nil {
+		t.Fatalf("extract valid TypeScript type query: %v", err)
+	}
+}
+
+func TestExtractAcceptsMultipleTypeQueryCallArguments(t *testing.T) {
+	_, err := Extract(extractor.Source{
+		ProjectID:  "project:fixture",
+		SourcePath: "src/type-queries.ts",
+		Contents:   []byte("const first = load<typeof import('./first.ts')>(); const second = load<typeof import('./second.ts')>();"),
+	})
+	if err != nil {
+		t.Fatalf("extract multiple valid TypeScript type-query calls: %v", err)
+	}
+}
+
+func TestExtractReportsActionableParseError(t *testing.T) {
+	_, err := Extract(extractor.Source{
+		ProjectID:  "project:fixture",
+		SourcePath: "src/broken.ts",
+		Contents:   []byte("const value = ;"),
+	})
+	if err == nil {
+		t.Fatal("extract malformed TypeScript source succeeded")
+	}
+	for _, want := range []string{`parse TypeScript source "src/broken.ts" at 1:13-1:14: ERROR`} {
+		if !strings.Contains(err.Error(), want) {
+			t.Errorf("parse error = %q, want %q", err, want)
+		}
+	}
+}
+
 func TestExtractIgnoresStringLiteralsInsideDeclarationExports(t *testing.T) {
 	contribution, err := Extract(extractor.Source{
 		ProjectID:  "project:fixture",
@@ -227,6 +276,25 @@ func TestExtractProvidesReExportForResolution(t *testing.T) {
 	}
 	if got := references[0].Target; got != "./support" {
 		t.Errorf("re-export target = %q, want %q", got, "./support")
+	}
+}
+
+func TestExtractProvidesTypeOnlyStarReExportForResolution(t *testing.T) {
+	contribution, err := Extract(extractor.Source{
+		ProjectID:  "project:fixture",
+		SourcePath: "src/main.ts",
+		Contents:   []byte("export type * from './support.ts';"),
+	})
+	if err != nil {
+		t.Fatalf("extract TypeScript type-only star re-export: %v", err)
+	}
+
+	references := contribution.UnresolvedReferences()
+	if len(references) != 1 {
+		t.Fatalf("unresolved reference count = %d, want 1", len(references))
+	}
+	if got := references[0].Target; got != "./support.ts" {
+		t.Errorf("type-only star re-export target = %q, want %q", got, "./support.ts")
 	}
 }
 
@@ -448,6 +516,36 @@ func TestResolvePageUsesResolverIndexForCrossPageCall(t *testing.T) {
 	}
 }
 
+func TestResolvePageReadsEachImportedTargetOnce(t *testing.T) {
+	helper, err := Extract(extractor.Source{
+		ProjectID:  "project:fixture",
+		SourcePath: "src/helper.ts",
+		Contents:   []byte("export function helper() {}"),
+	})
+	if err != nil {
+		t.Fatalf("extract helper facts: %v", err)
+	}
+	main, err := Extract(extractor.Source{
+		ProjectID:  "project:fixture",
+		SourcePath: "src/main.ts",
+		Contents:   []byte("import { helper } from './helper';\nexport function main() { helper(); helper(); }"),
+	})
+	if err != nil {
+		t.Fatalf("extract main facts: %v", err)
+	}
+
+	reads := 0
+	index := resolverIndex{targets: map[string]extractor.ResolverTarget{
+		"src/helper.ts": resolverTargetFromContribution(helper),
+	}, targetReads: &reads}
+	if _, err := ResolvePage(context.Background(), []extractor.Contribution{main}, "project:fixture", index); err != nil {
+		t.Fatalf("resolve TypeScript page: %v", err)
+	}
+	if reads != 2 {
+		t.Errorf("resolver target reads = %d, want one failed extensionless candidate and one successful target read", reads)
+	}
+}
+
 func TestResolvePageUsesResolverIndexForCrossPageReExport(t *testing.T) {
 	support, err := Extract(extractor.Source{
 		ProjectID:  "project:fixture",
@@ -480,10 +578,14 @@ func TestResolvePageUsesResolverIndexForCrossPageReExport(t *testing.T) {
 }
 
 type resolverIndex struct {
-	targets map[string]extractor.ResolverTarget
+	targets     map[string]extractor.ResolverTarget
+	targetReads *int
 }
 
 func (index resolverIndex) ResolverTarget(_ context.Context, request extractor.ResolverTargetRequest) (extractor.ResolverTarget, bool, error) {
+	if index.targetReads != nil {
+		*index.targetReads++
+	}
 	target, found := index.targets[request.SourcePath]
 	return target, found, nil
 }
@@ -578,6 +680,66 @@ func TestResolveAddsCrossFileExtendsRelationForAliasedImport(t *testing.T) {
 	}
 }
 
+func TestResolveAddsCrossFileClassToInterfaceExtendsRelation(t *testing.T) {
+	base, err := Extract(extractor.Source{
+		ProjectID:  "project:fixture",
+		SourcePath: "src/base.ts",
+		Contents:   []byte("export interface Base {}"),
+	})
+	if err != nil {
+		t.Fatalf("extract interface facts: %v", err)
+	}
+	child, err := Extract(extractor.Source{
+		ProjectID:  "project:fixture",
+		SourcePath: "src/child.ts",
+		Contents:   []byte("import { Base } from './base';\nexport class Child extends Base {}"),
+	})
+	if err != nil {
+		t.Fatalf("extract class facts: %v", err)
+	}
+
+	resolution, err := Resolve([]extractor.Contribution{child, base})
+	if err != nil {
+		t.Fatalf("resolve TypeScript class-to-interface inheritance: %v", err)
+	}
+
+	childID := child.Facts().Nodes[2].ID
+	baseID := base.Facts().Nodes[2].ID
+	if !hasRelation(resolution.Facts().Edges, childID, baseID, ExtendsRelation) {
+		t.Errorf("resolved facts = %+v, want extends edge from class %q to interface %q", resolution.Facts(), childID, baseID)
+	}
+}
+
+func TestResolveAddsCrossFileClassToVariableExtendsRelation(t *testing.T) {
+	base, err := Extract(extractor.Source{
+		ProjectID:  "project:fixture",
+		SourcePath: "src/base.ts",
+		Contents:   []byte("class Base {}\nexport const BaseElement = Base as typeof Base;"),
+	})
+	if err != nil {
+		t.Fatalf("extract constructable variable facts: %v", err)
+	}
+	child, err := Extract(extractor.Source{
+		ProjectID:  "project:fixture",
+		SourcePath: "src/child.ts",
+		Contents:   []byte("import { BaseElement } from './base';\nexport class Child extends BaseElement {}"),
+	})
+	if err != nil {
+		t.Fatalf("extract child facts: %v", err)
+	}
+
+	resolution, err := Resolve([]extractor.Contribution{child, base})
+	if err != nil {
+		t.Fatalf("resolve TypeScript class-to-variable inheritance: %v", err)
+	}
+
+	childID := child.Facts().Nodes[2].ID
+	baseElementID := base.Facts().Nodes[3].ID
+	if !hasRelation(resolution.Facts().Edges, childID, baseElementID, ExtendsRelation) {
+		t.Errorf("resolved facts = %+v, want extends edge from class %q to variable %q", resolution.Facts(), childID, baseElementID)
+	}
+}
+
 func TestResolveAddsCrossFileImplementsRelation(t *testing.T) {
 	contract, err := Extract(extractor.Source{
 		ProjectID:  "project:fixture",
@@ -638,6 +800,70 @@ func TestResolveAddsCrossFileInterfaceExtendsRelation(t *testing.T) {
 	}
 }
 
+func TestResolveAddsCrossFileInterfaceToTypeAliasExtendsRelation(t *testing.T) {
+	parent, err := Extract(extractor.Source{
+		ProjectID:  "project:fixture",
+		SourcePath: "src/parent.ts",
+		Contents:   []byte("export type Parent = { id: string };"),
+	})
+	if err != nil {
+		t.Fatalf("extract parent type alias facts: %v", err)
+	}
+	child, err := Extract(extractor.Source{
+		ProjectID:  "project:fixture",
+		SourcePath: "src/child.ts",
+		Contents:   []byte("import { Parent } from './parent';\nexport interface Child extends Parent {}"),
+	})
+	if err != nil {
+		t.Fatalf("extract child interface facts: %v", err)
+	}
+
+	resolution, err := Resolve([]extractor.Contribution{child, parent})
+	if err != nil {
+		t.Fatalf("resolve TypeScript interface-to-type-alias inheritance: %v", err)
+	}
+
+	childID := child.Facts().Nodes[2].ID
+	parentID := parent.Facts().Nodes[2].ID
+	if !hasRelation(resolution.Facts().Edges, childID, parentID, ExtendsRelation) {
+		t.Errorf("resolved facts = %+v, want interface extends edge from %q to type alias %q", resolution.Facts(), childID, parentID)
+	}
+}
+
+func TestResolveClassExtendsIgnoresGenericTypeArguments(t *testing.T) {
+	base, err := Extract(extractor.Source{
+		ProjectID:  "project:fixture",
+		SourcePath: "src/base.ts",
+		Contents:   []byte("export class Base<T> {}\nexport type Argument = { id: string };"),
+	})
+	if err != nil {
+		t.Fatalf("extract base facts: %v", err)
+	}
+	child, err := Extract(extractor.Source{
+		ProjectID:  "project:fixture",
+		SourcePath: "src/child.ts",
+		Contents:   []byte("import { Argument, Base } from './base';\nexport class Child extends Base<Argument> {}"),
+	})
+	if err != nil {
+		t.Fatalf("extract child facts: %v", err)
+	}
+
+	resolution, err := Resolve([]extractor.Contribution{child, base})
+	if err != nil {
+		t.Fatalf("resolve TypeScript class inheritance: %v", err)
+	}
+
+	childID := child.Facts().Nodes[2].ID
+	baseID := base.Facts().Nodes[2].ID
+	argumentID := base.Facts().Nodes[3].ID
+	if !hasRelation(resolution.Facts().Edges, childID, baseID, ExtendsRelation) {
+		t.Errorf("resolved facts = %+v, want extends edge from %q to %q", resolution.Facts(), childID, baseID)
+	}
+	if hasRelation(resolution.Facts().Edges, childID, argumentID, ExtendsRelation) {
+		t.Errorf("resolved facts = %+v, do not want extends edge from %q to generic argument %q", resolution.Facts(), childID, argumentID)
+	}
+}
+
 func TestResolveAddsCrossFileCallRelation(t *testing.T) {
 	helper, err := Extract(extractor.Source{
 		ProjectID:  "project:fixture",
@@ -695,6 +921,67 @@ func TestResolveAddsCrossFileCallRelationForDefaultImport(t *testing.T) {
 	helperID := helper.Facts().Nodes[2].ID
 	if !hasRelation(resolution.Facts().Edges, runID, helperID, CallsRelation) {
 		t.Errorf("resolved facts = %+v, want default-import calls edge from %q to %q", resolution.Facts(), runID, helperID)
+	}
+}
+
+func TestResolveAddsMethodCallRelationForImportedCallableVariable(t *testing.T) {
+	helper, err := Extract(extractor.Source{
+		ProjectID:  "project:fixture",
+		SourcePath: "src/helper.ts",
+		Contents:   []byte("export const helper = () => {};"),
+	})
+	if err != nil {
+		t.Fatalf("extract helper facts: %v", err)
+	}
+	caller, err := Extract(extractor.Source{
+		ProjectID:  "project:fixture",
+		SourcePath: "src/caller.ts",
+		Contents: []byte("import { helper } from './helper';\n" +
+			"class Service { run() { helper(); } }"),
+	})
+	if err != nil {
+		t.Fatalf("extract caller facts: %v", err)
+	}
+
+	resolution, err := Resolve([]extractor.Contribution{caller, helper})
+	if err != nil {
+		t.Fatalf("resolve TypeScript callable variable call: %v", err)
+	}
+
+	methodID := caller.Facts().Nodes[3].ID
+	helperID := helper.Facts().Nodes[2].ID
+	if !hasRelation(resolution.Facts().Edges, methodID, helperID, CallsRelation) {
+		t.Errorf("resolved facts = %+v, want calls edge from %q to %q", resolution.Facts(), methodID, helperID)
+	}
+}
+
+func TestResolveAddsFunctionCallRelationForImportedCallableVariable(t *testing.T) {
+	helper, err := Extract(extractor.Source{
+		ProjectID:  "project:fixture",
+		SourcePath: "src/helper.ts",
+		Contents:   []byte("export const helper = () => {};"),
+	})
+	if err != nil {
+		t.Fatalf("extract helper facts: %v", err)
+	}
+	caller, err := Extract(extractor.Source{
+		ProjectID:  "project:fixture",
+		SourcePath: "src/caller.ts",
+		Contents:   []byte("import { helper } from './helper';\nexport function run() { helper(); }"),
+	})
+	if err != nil {
+		t.Fatalf("extract caller facts: %v", err)
+	}
+
+	resolution, err := Resolve([]extractor.Contribution{caller, helper})
+	if err != nil {
+		t.Fatalf("resolve TypeScript callable variable call: %v", err)
+	}
+
+	functionID := caller.Facts().Nodes[2].ID
+	helperID := helper.Facts().Nodes[2].ID
+	if !hasRelation(resolution.Facts().Edges, functionID, helperID, CallsRelation) {
+		t.Errorf("resolved facts = %+v, want calls edge from %q to %q", resolution.Facts(), functionID, helperID)
 	}
 }
 

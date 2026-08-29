@@ -413,7 +413,11 @@ func TestResolvePageUsesResolverIndexForCrossPageCall(t *testing.T) {
 	if err != nil {
 		t.Fatalf("extract main facts: %v", err)
 	}
-	resolution, err := ResolvePage(context.Background(), []extractor.Contribution{main}, "project:fixture", pageResolverIndex{targets: map[string]extractor.ResolverTarget{"src/helper.js": pageResolverTarget(helper)}})
+	reads := 0
+	resolution, err := ResolvePage(context.Background(), []extractor.Contribution{main}, "project:fixture", pageResolverIndex{
+		targets:     map[string]extractor.ResolverTarget{"src/helper.js": pageResolverTarget(helper)},
+		targetReads: &reads,
+	})
 	if err != nil {
 		t.Fatalf("resolve JavaScript page: %v", err)
 	}
@@ -422,13 +426,20 @@ func TestResolvePageUsesResolverIndexForCrossPageCall(t *testing.T) {
 	if !hasPageResolvedEdge(resolution.Facts().Edges, mainFunctionID, helperFunctionID, CallsRelation) {
 		t.Errorf("resolved facts = %+v, want page call edge from %q to %q", resolution.Facts(), mainFunctionID, helperFunctionID)
 	}
+	if reads != 2 {
+		t.Errorf("resolver target reads = %d, want one failed extensionless candidate and one successful target read", reads)
+	}
 }
 
 type pageResolverIndex struct {
-	targets map[string]extractor.ResolverTarget
+	targets     map[string]extractor.ResolverTarget
+	targetReads *int
 }
 
 func (index pageResolverIndex) ResolverTarget(_ context.Context, request extractor.ResolverTargetRequest) (extractor.ResolverTarget, bool, error) {
+	if index.targetReads != nil {
+		*index.targetReads++
+	}
 	target, found := index.targets[request.SourcePath]
 	return target, found, nil
 }
@@ -543,6 +554,67 @@ func TestResolveAddsCrossFileCallRelationForDefaultImport(t *testing.T) {
 	helperID := helper.Facts().Nodes[2].ID
 	if !hasRelation(resolution.Facts().Edges, runID, helperID, CallsRelation) {
 		t.Errorf("resolved facts = %+v, want default-import calls edge from %q to %q", resolution.Facts(), runID, helperID)
+	}
+}
+
+func TestResolveAddsMethodCallRelationForImportedCallableVariable(t *testing.T) {
+	helper, err := Extract(extractor.Source{
+		ProjectID:  "project:fixture",
+		SourcePath: "src/helper.js",
+		Contents:   []byte("export const helper = () => {};"),
+	})
+	if err != nil {
+		t.Fatalf("extract helper facts: %v", err)
+	}
+	caller, err := Extract(extractor.Source{
+		ProjectID:  "project:fixture",
+		SourcePath: "src/caller.js",
+		Contents: []byte("import { helper } from './helper';\n" +
+			"class Service { run() { helper(); } }"),
+	})
+	if err != nil {
+		t.Fatalf("extract caller facts: %v", err)
+	}
+
+	resolution, err := Resolve([]extractor.Contribution{caller, helper})
+	if err != nil {
+		t.Fatalf("resolve JavaScript callable variable call: %v", err)
+	}
+
+	methodID := caller.Facts().Nodes[3].ID
+	helperID := helper.Facts().Nodes[2].ID
+	if !hasRelation(resolution.Facts().Edges, methodID, helperID, CallsRelation) {
+		t.Errorf("resolved facts = %+v, want calls edge from %q to %q", resolution.Facts(), methodID, helperID)
+	}
+}
+
+func TestResolveAddsFunctionCallRelationForImportedCallableVariable(t *testing.T) {
+	helper, err := Extract(extractor.Source{
+		ProjectID:  "project:fixture",
+		SourcePath: "src/helper.js",
+		Contents:   []byte("export const helper = () => {};"),
+	})
+	if err != nil {
+		t.Fatalf("extract helper facts: %v", err)
+	}
+	caller, err := Extract(extractor.Source{
+		ProjectID:  "project:fixture",
+		SourcePath: "src/caller.js",
+		Contents:   []byte("import { helper } from './helper';\nexport function run() { helper(); }"),
+	})
+	if err != nil {
+		t.Fatalf("extract caller facts: %v", err)
+	}
+
+	resolution, err := Resolve([]extractor.Contribution{caller, helper})
+	if err != nil {
+		t.Fatalf("resolve JavaScript callable variable call: %v", err)
+	}
+
+	functionID := caller.Facts().Nodes[2].ID
+	helperID := helper.Facts().Nodes[2].ID
+	if !hasRelation(resolution.Facts().Edges, functionID, helperID, CallsRelation) {
+		t.Errorf("resolved facts = %+v, want calls edge from %q to %q", resolution.Facts(), functionID, helperID)
 	}
 }
 

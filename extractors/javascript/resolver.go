@@ -58,8 +58,10 @@ func ResolverVocabulary() (graph.Vocabulary, error) {
 			Endpoints: []graph.EndpointRule{
 				{Source: FunctionNodeKind, Target: FunctionNodeKind},
 				{Source: FunctionNodeKind, Target: MethodNodeKind},
+				{Source: FunctionNodeKind, Target: VariableNodeKind},
 				{Source: MethodNodeKind, Target: FunctionNodeKind},
 				{Source: MethodNodeKind, Target: MethodNodeKind},
+				{Source: MethodNodeKind, Target: VariableNodeKind},
 			},
 		}},
 	})
@@ -77,6 +79,7 @@ func ResolvePage(ctx context.Context, contributions []extractor.Contribution, pr
 	if projectID == "" || index == nil {
 		return Resolution{}, fmt.Errorf("resolve JavaScript page: project and resolver index are required")
 	}
+	index = extractor.NewPageResolverIndex(index)
 	files := make(map[string]graph.Node, len(contributions))
 	byPath := make(map[string]extractor.Contribution, len(contributions))
 	nodes := make(map[string]graph.Node)

@@ -247,7 +247,7 @@ func (v Vocabulary) Validate(facts Facts) error {
 		if !endpointAllowed {
 			return &ValidationError{
 				Code:   InvalidRelationEndpoint,
-				Detail: fmt.Sprintf("relation %q does not permit %q -> %q", edge.Relation, sourceKind, targetKind),
+				Detail: fmt.Sprintf("relation %q does not permit %q -> %q at %s:%d:%d", edge.Relation, sourceKind, targetKind, edge.Evidence.Span.Path, edge.Evidence.Span.StartLine, edge.Evidence.Span.StartColumn),
 			}
 		}
 	}

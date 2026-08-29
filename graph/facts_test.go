@@ -2,6 +2,7 @@ package graph_test
 
 import (
 	"errors"
+	"strings"
 	"testing"
 
 	"agent-graph/graph"
@@ -255,6 +256,9 @@ func TestVocabularyRejectsInvalidRelationEndpoint(t *testing.T) {
 	}
 	if validationError.Code != graph.InvalidRelationEndpoint {
 		t.Fatalf("validation error code = %q, want %q", validationError.Code, graph.InvalidRelationEndpoint)
+	}
+	if !strings.Contains(validationError.Detail, "src/main.ts:1:1") {
+		t.Errorf("validation error detail = %q, want source location", validationError.Detail)
 	}
 }
 

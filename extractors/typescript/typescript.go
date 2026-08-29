@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"regexp"
 	"sort"
 	"strconv"
 	"strings"
@@ -53,6 +54,11 @@ type declaration struct {
 	nameStart     uint
 	nameEnd       uint
 }
+
+var (
+	typeQueryCallPattern        = regexp.MustCompile(`typeof[[:space:]]+import[[:space:]]*\([[:space:]]*(?:'([^'\\]|\\.)*'|"([^"\\]|\\.)*")[[:space:]]*\)`)
+	typeOnlyStarReExportPattern = regexp.MustCompile(`\bexport([[:space:]]+)type([[:space:]]+)\*([[:space:]]+)from\b`)
+)
 
 func (extractorDefinition) Metadata() extractor.Metadata {
 	return extractor.Metadata{
@@ -124,11 +130,11 @@ func (worker *Worker) Extract(source extractor.Source) (extractor.Contribution, 
 	if parser == nil {
 		return extractor.Contribution{}, fmt.Errorf("TypeScript worker is closed")
 	}
-	tree := parser.Parse(source.Contents, nil)
+	tree := parseTypeScript(parser, source.Contents)
 	defer tree.Close()
 	root := tree.RootNode()
 	if root.HasError() {
-		return extractor.Contribution{}, fmt.Errorf("parse TypeScript source %q", source.SourcePath)
+		return extractor.Contribution{}, typeScriptParseError(source.SourcePath, root)
 	}
 
 	vocabulary, err := New().Vocabulary()
@@ -168,6 +174,95 @@ func (worker *Worker) Extract(source extractor.Source) (extractor.Contribution, 
 		ExportedSurfaces:     exportedSurfaces,
 		Diagnostics:          analysis.diagnostics,
 	})
+}
+
+func parseTypeScript(parser *sitter.Parser, contents []byte) *sitter.Tree {
+	tree := parser.Parse(contents, nil)
+	if !tree.RootNode().HasError() {
+		return tree
+	}
+
+	parsedContents, recovered := recoverTypeQueryCallArguments(contents)
+	parsedContents, recoveredTypeOnlyStarReExport := recoverTypeOnlyStarReExports(parsedContents)
+	recovered = recovered || recoveredTypeOnlyStarReExport
+	if !recovered {
+		return tree
+	}
+	recoveredTree := parser.Parse(parsedContents, nil)
+	if recoveredTree.RootNode().HasError() {
+		recoveredTree.Close()
+		return tree
+	}
+	tree.Close()
+	return recoveredTree
+}
+
+func recoverTypeQueryCallArguments(contents []byte) ([]byte, bool) {
+	recovered := append([]byte(nil), contents...)
+	found := false
+	for _, match := range typeQueryCallPattern.FindAllIndex(contents, -1) {
+		if !typeQueryCallIsTypeArgument(contents, match[0], match[1]) {
+			continue
+		}
+		for index := match[0]; index < match[1]; index++ {
+			if recovered[index] != '\n' && recovered[index] != '\r' {
+				recovered[index] = ' '
+			}
+		}
+		copy(recovered[match[0]:], "unknown")
+		found = true
+	}
+	return recovered, found
+}
+
+func recoverTypeOnlyStarReExports(contents []byte) ([]byte, bool) {
+	recovered := append([]byte(nil), contents...)
+	found := false
+	for _, match := range typeOnlyStarReExportPattern.FindAllSubmatchIndex(contents, -1) {
+		for index := match[3]; index < match[4]; index++ {
+			recovered[index] = ' '
+		}
+		found = true
+	}
+	return recovered, found
+}
+
+func typeQueryCallIsTypeArgument(contents []byte, start, end int) bool {
+	before := start - 1
+	for before >= 0 && (contents[before] == ' ' || contents[before] == '\t' || contents[before] == '\n' || contents[before] == '\r') {
+		before--
+	}
+	after := end
+	for after < len(contents) && (contents[after] == ' ' || contents[after] == '\t' || contents[after] == '\n' || contents[after] == '\r') {
+		after++
+	}
+	return before >= 0 && contents[before] == '<' && after < len(contents) && contents[after] == '>'
+}
+
+func typeScriptParseError(sourcePath string, root *sitter.Node) error {
+	node := firstParseErrorNode(root)
+	if node == nil {
+		return fmt.Errorf("parse TypeScript source %q: parser reported an unspecified error", sourcePath)
+	}
+	start := node.StartPosition()
+	end := node.EndPosition()
+	reason := node.Kind()
+	if node.IsMissing() {
+		reason = "missing " + reason
+	}
+	return fmt.Errorf("parse TypeScript source %q at %d:%d-%d:%d: %s", sourcePath, start.Row+1, start.Column+1, end.Row+1, end.Column+1, reason)
+}
+
+func firstParseErrorNode(node *sitter.Node) *sitter.Node {
+	if node.IsError() || node.IsMissing() {
+		return node
+	}
+	for index := uint(0); index < node.ChildCount(); index++ {
+		if errorNode := firstParseErrorNode(node.Child(index)); errorNode != nil {
+			return errorNode
+		}
+	}
+	return nil
 }
 
 func (worker *Worker) parserForPath(path string) *sitter.Parser {
@@ -297,6 +392,9 @@ func classHeritageRelation(kind string) (graph.RelationKind, bool) {
 func appendSymbolReferences(source extractor.Source, node *sitter.Node, sourceID string, relation graph.RelationKind, references *[]extractor.SymbolReference) {
 	for childIndex := uint(0); childIndex < node.NamedChildCount(); childIndex++ {
 		child := node.NamedChild(childIndex)
+		if child.Kind() == "type_arguments" {
+			continue
+		}
 		if child.Kind() == "type_identifier" || child.Kind() == "identifier" {
 			*references = append(*references, extractor.SymbolReference{
 				SourceID: sourceID,

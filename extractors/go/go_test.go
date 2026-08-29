@@ -268,9 +268,13 @@ func TestResolvePageUsesResolverIndexForCrossPagePackageCall(t *testing.T) {
 	if err != nil {
 		t.Fatalf("create resolver file view: %v", err)
 	}
-	resolution, err := ResolvePage(context.Background(), []extractor.Contribution{main}, "project:fixture", pageResolverIndex{packages: map[string][]extractor.ResolverTarget{
-		"internal/helper": {pageResolverTarget(helper)},
-	}}, view)
+	reads := 0
+	resolution, err := ResolvePage(context.Background(), []extractor.Contribution{main}, "project:fixture", pageResolverIndex{
+		packages: map[string][]extractor.ResolverTarget{
+			"internal/helper": {pageResolverTarget(helper)},
+		},
+		packagePageReads: &reads,
+	}, view)
 	if err != nil {
 		t.Fatalf("resolve Go page: %v", err)
 	}
@@ -278,6 +282,9 @@ func TestResolvePageUsesResolverIndexForCrossPagePackageCall(t *testing.T) {
 	helperID := findNodeID(t, helper.Facts(), FunctionNodeKind, "Help")
 	if !hasFactEdge(resolution.Facts(), mainID, helperID, CallsRelation) {
 		t.Errorf("facts = %+v, want indexed package call fact", resolution.Facts())
+	}
+	if reads != 2 {
+		t.Errorf("resolver package page reads = %d, want one data page and one terminal page", reads)
 	}
 }
 
@@ -342,7 +349,8 @@ func TestResolvePageUsesResolverIndexForCrossPageInterfaceEmbedding(t *testing.T
 }
 
 type pageResolverIndex struct {
-	packages map[string][]extractor.ResolverTarget
+	packages         map[string][]extractor.ResolverTarget
+	packagePageReads *int
 }
 
 func (index pageResolverIndex) ResolverTarget(context.Context, extractor.ResolverTargetRequest) (extractor.ResolverTarget, bool, error) {
@@ -350,6 +358,9 @@ func (index pageResolverIndex) ResolverTarget(context.Context, extractor.Resolve
 }
 
 func (index pageResolverIndex) ResolverPackagePage(_ context.Context, request extractor.ResolverPackagePageRequest) ([]extractor.ResolverTarget, error) {
+	if index.packagePageReads != nil {
+		*index.packagePageReads++
+	}
 	targets := make([]extractor.ResolverTarget, 0, request.Limit)
 	for _, target := range index.packages[request.PackagePath] {
 		if target.SourcePath <= request.AfterSourcePath {

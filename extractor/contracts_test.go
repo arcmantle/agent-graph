@@ -1,6 +1,8 @@
 package extractor_test
 
 import (
+	"context"
+	"errors"
 	"testing"
 
 	"agent-graph/extractor"
@@ -226,6 +228,168 @@ func TestResolverFileViewRequiresProjectRootAndCopiesFiles(t *testing.T) {
 	if !found || string(contents) != "original" {
 		t.Errorf("view contents after caller mutation = %q, want %q", contents, "original")
 	}
+}
+
+func TestPageResolverIndexCachesTargetAndReturnsDefensiveCopies(t *testing.T) {
+	request := extractor.ResolverTargetRequest{ProjectID: "project:fixture", Language: "typescript", SourcePath: "src/helper.ts"}
+	underlying := &resolverIndexStub{target: extractor.ResolverTarget{
+		ProjectID:  "project:fixture",
+		SourcePath: "src/helper.ts",
+		Metadata:   extractor.Metadata{Name: "typescript", Extensions: []string{".ts"}},
+		Nodes:      []graph.Node{{ID: "function:helper"}},
+		UnresolvedReferences: []extractor.UnresolvedReference{{
+			SourceID: "function:helper",
+			Target:   "./support",
+			Bindings: []extractor.ModuleBinding{{ImportedName: "support"}},
+		}},
+		SymbolReferences: []extractor.SymbolReference{{SourceID: "function:helper", Target: "support"}},
+		ExportedSurfaces: []extractor.ExportedSurface{{NodeID: "function:helper", Name: "helper"}},
+		Diagnostics:      []extractor.Diagnostic{{Severity: extractor.DiagnosticWarning, Message: "fixture"}},
+	}, found: true}
+	index := extractor.NewPageResolverIndex(underlying)
+
+	target, found, err := index.ResolverTarget(context.Background(), request)
+	if err != nil || !found {
+		t.Fatalf("resolve target: found = %t, error = %v", found, err)
+	}
+	target.Metadata.Extensions[0] = ".changed"
+	target.Nodes[0].ID = "changed"
+	target.UnresolvedReferences[0].Target = "changed"
+	target.UnresolvedReferences[0].Bindings[0].ImportedName = "changed"
+	target.SymbolReferences[0].Target = "changed"
+	target.ExportedSurfaces[0].Name = "changed"
+	target.Diagnostics[0].Message = "changed"
+
+	target, found, err = index.ResolverTarget(context.Background(), request)
+	if err != nil || !found {
+		t.Fatalf("resolve cached target: found = %t, error = %v", found, err)
+	}
+	if underlying.targetReads != 1 {
+		t.Errorf("underlying target reads = %d, want 1", underlying.targetReads)
+	}
+	if target.Metadata.Extensions[0] != ".ts" || target.Nodes[0].ID != "function:helper" ||
+		target.UnresolvedReferences[0].Target != "./support" || target.UnresolvedReferences[0].Bindings[0].ImportedName != "support" ||
+		target.SymbolReferences[0].Target != "support" || target.ExportedSurfaces[0].Name != "helper" || target.Diagnostics[0].Message != "fixture" {
+		t.Errorf("cached target was changed through a returned value: %+v", target)
+	}
+}
+
+func TestPageResolverIndexCachesPackagePageAndReturnsDefensiveCopies(t *testing.T) {
+	request := extractor.ResolverPackagePageRequest{
+		ProjectID:   "project:fixture",
+		Language:    "go",
+		PackagePath: "internal/helper",
+		Limit:       100,
+	}
+	underlying := &resolverIndexStub{packagePage: []extractor.ResolverTarget{{
+		ProjectID:  "project:fixture",
+		SourcePath: "internal/helper/helper.go",
+		Nodes:      []graph.Node{{ID: "function:helper"}},
+	}}}
+	index := extractor.NewPageResolverIndex(underlying)
+
+	page, err := index.ResolverPackagePage(context.Background(), request)
+	if err != nil {
+		t.Fatalf("resolve package page: %v", err)
+	}
+	page[0].SourcePath = "changed.go"
+	page[0].Nodes[0].ID = "changed"
+	page = append(page, extractor.ResolverTarget{SourcePath: "extra.go"})
+
+	page, err = index.ResolverPackagePage(context.Background(), request)
+	if err != nil {
+		t.Fatalf("resolve cached package page: %v", err)
+	}
+	if underlying.packagePageReads != 1 {
+		t.Errorf("underlying package page reads = %d, want 1", underlying.packagePageReads)
+	}
+	if len(page) != 1 || page[0].SourcePath != "internal/helper/helper.go" || page[0].Nodes[0].ID != "function:helper" {
+		t.Errorf("cached package page was changed through a returned value: %+v", page)
+	}
+}
+
+func TestPageResolverIndexCachesMissingAndFailedResults(t *testing.T) {
+	targetRequest := extractor.ResolverTargetRequest{ProjectID: "project:fixture", Language: "typescript", SourcePath: "src/missing.ts"}
+	missing := &resolverIndexStub{}
+	index := extractor.NewPageResolverIndex(missing)
+	for range 2 {
+		if _, found, err := index.ResolverTarget(context.Background(), targetRequest); err != nil || found {
+			t.Fatalf("resolve missing target: found = %t, error = %v", found, err)
+		}
+	}
+	if missing.targetReads != 1 {
+		t.Errorf("underlying missing target reads = %d, want 1", missing.targetReads)
+	}
+	for range 2 {
+		page, err := index.ResolverPackagePage(context.Background(), extractor.ResolverPackagePageRequest{ProjectID: "project:fixture", Language: "go", PackagePath: "missing", Limit: 100})
+		if err != nil || page != nil {
+			t.Fatalf("resolve missing package page: page = %+v, error = %v; want nil page and nil error", page, err)
+		}
+	}
+	if missing.packagePageReads != 1 {
+		t.Errorf("underlying missing package page reads = %d, want 1", missing.packagePageReads)
+	}
+
+	targetError := errors.New("target read failed")
+	packageError := errors.New("package read failed")
+	failed := &resolverIndexStub{targetError: targetError, packagePageError: packageError}
+	index = extractor.NewPageResolverIndex(failed)
+	packageRequest := extractor.ResolverPackagePageRequest{ProjectID: "project:fixture", Language: "go", PackagePath: "missing", Limit: 100}
+	for range 2 {
+		if _, _, err := index.ResolverTarget(context.Background(), targetRequest); !errors.Is(err, targetError) {
+			t.Fatalf("resolve failed target error = %v, want %v", err, targetError)
+		}
+		if _, err := index.ResolverPackagePage(context.Background(), packageRequest); !errors.Is(err, packageError) {
+			t.Fatalf("resolve failed package page error = %v, want %v", err, packageError)
+		}
+	}
+	if failed.targetReads != 1 || failed.packagePageReads != 1 {
+		t.Errorf("underlying failed reads = target %d, package page %d; want 1 each", failed.targetReads, failed.packagePageReads)
+	}
+}
+
+func TestPageResolverIndexUsesCompleteRequestsAndHasPageLifetime(t *testing.T) {
+	underlying := &resolverIndexStub{}
+	targetRequest := extractor.ResolverTargetRequest{ProjectID: "project:fixture", Language: "typescript", SourcePath: "src/helper.ts"}
+	packageRequest := extractor.ResolverPackagePageRequest{ProjectID: "project:fixture", Language: "go", PackagePath: "internal/helper", Limit: 100}
+
+	index := extractor.NewPageResolverIndex(underlying)
+	_, _, _ = index.ResolverTarget(context.Background(), targetRequest)
+	differentTargetRequest := targetRequest
+	differentTargetRequest.Language = "javascript"
+	_, _, _ = index.ResolverTarget(context.Background(), differentTargetRequest)
+	_, _ = index.ResolverPackagePage(context.Background(), packageRequest)
+	differentPackageRequest := packageRequest
+	differentPackageRequest.AfterSourcePath = "internal/helper/first.go"
+	_, _ = index.ResolverPackagePage(context.Background(), differentPackageRequest)
+
+	newPageIndex := extractor.NewPageResolverIndex(underlying)
+	_, _, _ = newPageIndex.ResolverTarget(context.Background(), targetRequest)
+	_, _ = newPageIndex.ResolverPackagePage(context.Background(), packageRequest)
+
+	if underlying.targetReads != 3 || underlying.packagePageReads != 3 {
+		t.Errorf("underlying reads = target %d, package page %d; want 3 each", underlying.targetReads, underlying.packagePageReads)
+	}
+}
+
+type resolverIndexStub struct {
+	target           extractor.ResolverTarget
+	found            bool
+	targetError      error
+	targetReads      int
+	packagePage      []extractor.ResolverTarget
+	packagePageError error
+	packagePageReads int
+}
+
+func (index *resolverIndexStub) ResolverTarget(context.Context, extractor.ResolverTargetRequest) (extractor.ResolverTarget, bool, error) {
+	index.targetReads++
+	return index.target, index.found, index.targetError
+}
+
+func (index *resolverIndexStub) ResolverPackagePage(context.Context, extractor.ResolverPackagePageRequest) ([]extractor.ResolverTarget, error) {
+	index.packagePageReads++
+	return index.packagePage, index.packagePageError
 }
 
 func validContributionInput() extractor.ContributionInput {
