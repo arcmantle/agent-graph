@@ -14,8 +14,7 @@ agent-graph --help
 `@arcmantle/agent-graph` is also published as the canonical scoped package.
 
 The npm package downloads a checksum-verified native binary for Windows x64,
-Linux x64, and macOS x64 or arm64. It requires Node.js 18 or later during
-installation.
+Linux x64, and macOS arm64. It requires Node.js 18 or later during installation.
 
 ## Publish A Release
 

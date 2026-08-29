@@ -8,7 +8,7 @@ const releaseBaseURL = "https://github.com/arcmantle/agent-graph/releases/downlo
 
 function platformAsset(platform = process.platform, architecture = process.arch) {
   const supported = {
-    darwin: new Set(["arm64", "x64"]),
+    darwin: new Set(["arm64"]),
     linux: new Set(["x64"]),
     win32: new Set(["x64"])
   };

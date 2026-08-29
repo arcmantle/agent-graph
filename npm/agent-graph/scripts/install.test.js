@@ -5,12 +5,12 @@ const { expectedChecksum, platformAsset } = require("./install.js");
 
 test("platformAsset maps supported release platforms", () => {
   assert.equal(platformAsset("darwin", "arm64"), "agent-graph-darwin-arm64.gz");
-  assert.equal(platformAsset("darwin", "x64"), "agent-graph-darwin-x64.gz");
   assert.equal(platformAsset("linux", "x64"), "agent-graph-linux-x64.gz");
   assert.equal(platformAsset("win32", "x64"), "agent-graph-win32-x64.gz");
 });
 
 test("platformAsset rejects unsupported release platforms", () => {
+  assert.throws(() => platformAsset("darwin", "x64"), /Unsupported platform/);
   assert.throws(() => platformAsset("linux", "arm64"), /Unsupported platform/);
   assert.throws(() => platformAsset("win32", "arm64"), /Unsupported platform/);
 });
