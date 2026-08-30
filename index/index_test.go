@@ -13,15 +13,15 @@ import (
 	"testing"
 	"time"
 
-	"agent-graph/extractor"
-	goextractor "agent-graph/extractors/go"
-	"agent-graph/extractors/typescript"
-	"agent-graph/graph"
-	"agent-graph/index"
-	"agent-graph/indexer"
-	"agent-graph/storage"
-	"agent-graph/storage/sqlite"
-	"agent-graph/testkit"
+	"agent-atlas/extractor"
+	goextractor "agent-atlas/extractors/go"
+	"agent-atlas/extractors/typescript"
+	"agent-atlas/graph"
+	"agent-atlas/index"
+	"agent-atlas/indexer"
+	"agent-atlas/storage"
+	"agent-atlas/storage/sqlite"
+	"agent-atlas/testkit"
 )
 
 type contributionSessionStore struct {

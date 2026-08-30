@@ -12,14 +12,14 @@ import (
 	"sync"
 	"time"
 
-	"agent-graph/extractor"
-	goextractor "agent-graph/extractors/go"
-	"agent-graph/extractors/javascript"
-	"agent-graph/extractors/registry"
-	"agent-graph/extractors/typescript"
-	"agent-graph/graph"
-	"agent-graph/storage"
-	"agent-graph/workspace"
+	"agent-atlas/extractor"
+	goextractor "agent-atlas/extractors/go"
+	"agent-atlas/extractors/javascript"
+	"agent-atlas/extractors/registry"
+	"agent-atlas/extractors/typescript"
+	"agent-atlas/graph"
+	"agent-atlas/storage"
+	"agent-atlas/workspace"
 )
 
 type Request struct {

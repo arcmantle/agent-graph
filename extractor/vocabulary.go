@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"strings"
 
-	"agent-graph/graph"
+	"agent-atlas/graph"
 )
 
 func NewLanguageVocabulary(name string, declarationKinds []graph.NodeKind) (graph.Vocabulary, error) {

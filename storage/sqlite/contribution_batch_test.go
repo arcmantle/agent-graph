@@ -6,8 +6,8 @@ import (
 	"strings"
 	"testing"
 
-	"agent-graph/extractor"
-	"agent-graph/graph"
+	"agent-atlas/extractor"
+	"agent-atlas/graph"
 )
 
 func TestContributionSessionBatchFlushesAtSourceLimit(t *testing.T) {

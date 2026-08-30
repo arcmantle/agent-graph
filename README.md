@@ -1,17 +1,15 @@
-# agent-graph
+# agent-atlas
 
-`agent-graph` is a local-first, continuously updated code graph for AI agents.
+`agent-atlas` is a local-first, continuously updated code graph for AI agents.
 
 ## Install
 
 Install the released command-line tool from npm:
 
 ```bash
-npm install --global agent-graph
-agent-graph --help
+npm install --global @arcmantle/agent-atlas
+agent-atlas --help
 ```
-
-`@arcmantle/agent-graph` is also published as the canonical scoped package.
 
 The npm package downloads a checksum-verified native binary for Windows x64,
 Linux x64, and macOS arm64. It requires Node.js 18 or later during installation.
@@ -21,7 +19,8 @@ Linux x64, and macOS arm64. It requires Node.js 18 or later during installation.
 The release workflow runs when a signed-off version tag is pushed. It builds
 native binaries, creates a GitHub release and checksum manifest, then publishes
 the npm package. Before the first release, add an npm automation token with
-publish access for both package names as the organization `NPM_PUBLISH` secret.
+publish access for `@arcmantle/agent-atlas` as the organization `NPM_PUBLISH`
+secret.
 
 The package version and Git tag must match:
 
@@ -33,7 +32,7 @@ git push origin v0.1.0
 It is intended to work beside `agent-issues`:
 
 - `agent-issues` records work state, plans, dependencies, and decisions.
-- `agent-graph` records code structure, relationships, change impact, and architecture context.
+- `agent-atlas` records code structure, relationships, change impact, and architecture context.
 
 The goal is to make broad codebase questions fast and evidence-based without replacing source inspection, language-server navigation, tests, or Git.
 
@@ -46,7 +45,7 @@ Graphify demonstrates the value of a code graph for AI workflows, but its JSON-f
 - Per-package graphs require separate updates and a merge step.
 - Reports and visualization do not need to update on every edit.
 
-`agent-graph` will use Graphify as a behavioral reference while taking a database-first, Go-native approach to indexing and updates.
+`agent-atlas` will use Graphify as a behavioral reference while taking a database-first, Go-native approach to indexing and updates.
 
 ## Product Principles
 
@@ -123,18 +122,18 @@ question terms
 Support commands such as:
 
 ```text
-agent-graph index
-agent-graph watch
-agent-graph query "How does X reach Y?"
-agent-graph path X Y
-agent-graph explain X
-agent-graph report
-agent-graph export
+agent-atlas index
+agent-atlas watch
+agent-atlas query "How does X reach Y?"
+agent-atlas path X Y
+agent-atlas explain X
+agent-atlas report
+agent-atlas export
 ```
 
 ## Relationship To AI Workflows
 
-An AI agent should use `agent-graph` to find relevant code areas and relationships for architecture, dependency, call-flow, and impact questions. It must inspect the current source before edits and use tests and Git diff for verification.
+An AI agent should use `agent-atlas` to find relevant code areas and relationships for architecture, dependency, call-flow, and impact questions. It must inspect the current source before edits and use tests and Git diff for verification.
 
 The graph can be stale between index updates. Query results must identify the graph version and source evidence.
 
@@ -190,5 +189,5 @@ This command runs the storage conformance, extraction, indexing, query, path, ex
 The ClientFlex acceptance test is opt-in because the corpus is private and external. It uses a temporary SQLite database and does not write graph artifacts to the corpus.
 
 ```bash
-AGENT_GRAPH_CLIENTFLEX_ROOT=/path/to/ClientFlex CGO_ENABLED=1 go test ./acceptance -run '^TestClientFlexAcceptanceIndexesIntoTemporaryDatabase$' -v
+AGENT_ATLAS_CLIENTFLEX_ROOT=/path/to/ClientFlex CGO_ENABLED=1 go test ./acceptance -run '^TestClientFlexAcceptanceIndexesIntoTemporaryDatabase$' -v
 ```

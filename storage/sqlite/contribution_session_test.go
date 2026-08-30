@@ -10,10 +10,10 @@ import (
 	"testing"
 	"time"
 
-	"agent-graph/extractor"
-	"agent-graph/graph"
-	"agent-graph/storage"
-	"agent-graph/storage/sqlite"
+	"agent-atlas/extractor"
+	"agent-atlas/graph"
+	"agent-atlas/storage"
+	"agent-atlas/storage/sqlite"
 
 	_ "github.com/mattn/go-sqlite3"
 )

@@ -7,8 +7,8 @@ import (
 	"strings"
 	"unicode"
 
-	"agent-graph/graph"
-	"agent-graph/storage"
+	"agent-atlas/graph"
+	"agent-atlas/storage"
 )
 
 const maxSeedsPerTerm = 3

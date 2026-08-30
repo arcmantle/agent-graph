@@ -25,4 +25,4 @@ jobs:
       - name: Vet
         run: go vet ./...
       - name: Build
-        run: go build ./cmd/agent-graph
+        run: go build ./cmd/agent-atlas

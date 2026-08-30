@@ -10,7 +10,7 @@ import (
 )
 
 const (
-	stateDirectory = ".agent-graph"
+	stateDirectory = ".agent-atlas"
 	lockFileName   = "indexer.lock"
 	endpointName   = "indexer.sock"
 )

@@ -5,9 +5,9 @@ import (
 	"errors"
 	"testing"
 
-	"agent-graph/extractor"
-	"agent-graph/graph"
-	"agent-graph/storage"
+	"agent-atlas/extractor"
+	"agent-atlas/graph"
+	"agent-atlas/storage"
 )
 
 func TestOpenSnapshotRequestSelectsNamedVersion(t *testing.T) {

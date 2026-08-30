@@ -9,11 +9,11 @@ import (
 	"testing"
 	"time"
 
-	"agent-graph/benchmark"
-	"agent-graph/graph"
-	"agent-graph/index"
-	"agent-graph/storage"
-	"agent-graph/storage/sqlite"
+	"agent-atlas/benchmark"
+	"agent-atlas/graph"
+	"agent-atlas/index"
+	"agent-atlas/storage"
+	"agent-atlas/storage/sqlite"
 )
 
 func TestValidateAcceptsOneInLimitRun(t *testing.T) {

@@ -5,7 +5,7 @@ import (
 	"strings"
 	"testing"
 
-	"agent-graph/graph"
+	"agent-atlas/graph"
 )
 
 func testEvidence() graph.FactEvidence {

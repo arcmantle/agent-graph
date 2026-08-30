@@ -1,4 +1,4 @@
-module agent-graph
+module agent-atlas
 
 go 1.25.0
 

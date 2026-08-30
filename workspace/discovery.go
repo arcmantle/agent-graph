@@ -155,12 +155,12 @@ func loadIgnoreRules(workspaceRoot string) (ignoreRules, error) {
 		return ignoreRules{}, err
 	}
 
-	contents, err := os.ReadFile(filepath.Join(workspaceRoot, ".agraphignore"))
+	contents, err := os.ReadFile(filepath.Join(workspaceRoot, ".atlasignore"))
 	if os.IsNotExist(err) {
 		return ignoreRules{gitIgnores: gitIgnores}, nil
 	}
 	if err != nil {
-		return ignoreRules{}, fmt.Errorf("read root .agraphignore: %w", err)
+		return ignoreRules{}, fmt.Errorf("read root .atlasignore: %w", err)
 	}
 
 	lines := strings.Split(string(contents), "\n")
@@ -298,7 +298,7 @@ func matchesGitIgnorePattern(pattern gitIgnorePattern, sourcePath string, direct
 func internalDirectory(sourcePath string) bool {
 	for _, component := range strings.Split(sourcePath, "/") {
 		switch component {
-		case ".agent-graph", ".git", "node_modules":
+		case ".agent-atlas", ".git", "node_modules":
 			return true
 		}
 	}

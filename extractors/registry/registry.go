@@ -3,10 +3,10 @@ package registry
 import (
 	"fmt"
 
-	"agent-graph/extractor"
-	goextractor "agent-graph/extractors/go"
-	"agent-graph/extractors/javascript"
-	"agent-graph/extractors/typescript"
+	"agent-atlas/extractor"
+	goextractor "agent-atlas/extractors/go"
+	"agent-atlas/extractors/javascript"
+	"agent-atlas/extractors/typescript"
 )
 
 type Registry struct {

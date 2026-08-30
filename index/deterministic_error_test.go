@@ -12,14 +12,14 @@ import (
 	"testing"
 	"time"
 
-	"agent-graph/extractor"
-	"agent-graph/extractors/registry"
-	"agent-graph/extractors/typescript"
-	"agent-graph/graph"
-	"agent-graph/storage"
-	"agent-graph/storage/sqlite"
-	"agent-graph/testkit"
-	"agent-graph/workspace"
+	"agent-atlas/extractor"
+	"agent-atlas/extractors/registry"
+	"agent-atlas/extractors/typescript"
+	"agent-atlas/graph"
+	"agent-atlas/storage"
+	"agent-atlas/storage/sqlite"
+	"agent-atlas/testkit"
+	"agent-atlas/workspace"
 )
 
 func TestIndexReturnsDeterministicConcurrentExtractionError(t *testing.T) {

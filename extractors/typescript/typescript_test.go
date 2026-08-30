@@ -11,9 +11,9 @@ import (
 	"sync"
 	"testing"
 
-	"agent-graph/extractor"
-	"agent-graph/graph"
-	"agent-graph/testkit"
+	"agent-atlas/extractor"
+	"agent-atlas/graph"
+	"agent-atlas/testkit"
 
 	sitter "github.com/tree-sitter/go-tree-sitter"
 )

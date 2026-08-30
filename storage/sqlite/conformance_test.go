@@ -5,9 +5,9 @@ import (
 	"path/filepath"
 	"testing"
 
-	"agent-graph/storage"
-	"agent-graph/storage/conformance"
-	"agent-graph/storage/sqlite"
+	"agent-atlas/storage"
+	"agent-atlas/storage/conformance"
+	"agent-atlas/storage/sqlite"
 )
 
 func TestStoreConformance(t *testing.T) {

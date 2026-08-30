@@ -59,7 +59,7 @@ func GenerateCorpusWithProgress(root string, specification CorpusSpec, progress 
 		return Corpus{}, fmt.Errorf("generate benchmark corpus: root, positive source file count, positive function count, and valid additional function settings are required")
 	}
 
-	if err := os.WriteFile(filepath.Join(root, "package.json"), []byte(`{"name":"agent-graph-benchmark","type":"module"}`), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(root, "package.json"), []byte(`{"name":"agent-atlas-benchmark","type":"module"}`), 0o644); err != nil {
 		return Corpus{}, fmt.Errorf("generate benchmark corpus: write package manifest: %w", err)
 	}
 	if err := os.MkdirAll(filepath.Join(root, "src"), 0o755); err != nil {
@@ -165,7 +165,7 @@ func GenerateRealisticCorpusWithProgress(root string, specification RealisticCor
 		return Corpus{}, fmt.Errorf("generate realistic benchmark corpus: root and a positive source file count are required")
 	}
 
-	if err := os.WriteFile(filepath.Join(root, "package.json"), []byte(`{"name":"agent-graph-benchmark","type":"module"}`), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(root, "package.json"), []byte(`{"name":"agent-atlas-benchmark","type":"module"}`), 0o644); err != nil {
 		return Corpus{}, fmt.Errorf("generate realistic benchmark corpus: write package manifest: %w", err)
 	}
 	if err := os.MkdirAll(filepath.Join(root, "src"), 0o755); err != nil {

@@ -4,8 +4,8 @@ import (
 	"context"
 	"fmt"
 
-	"agent-graph/graph"
-	"agent-graph/storage"
+	"agent-atlas/graph"
+	"agent-atlas/storage"
 )
 
 type Request struct {

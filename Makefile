@@ -1,7 +1,7 @@
 .PHONY: build test acceptance lint check
 
 build:
-	CGO_ENABLED=1 go build ./cmd/agent-graph
+	CGO_ENABLED=1 go build ./cmd/agent-atlas
 
 test:
 	CGO_ENABLED=1 go test ./...

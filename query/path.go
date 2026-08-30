@@ -5,8 +5,8 @@ import (
 	"fmt"
 	"sort"
 
-	"agent-graph/graph"
-	"agent-graph/storage"
+	"agent-atlas/graph"
+	"agent-atlas/storage"
 )
 
 type PathRequest struct {

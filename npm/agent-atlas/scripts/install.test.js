@@ -4,9 +4,9 @@ const test = require("node:test");
 const { expectedChecksum, platformAsset } = require("./install.js");
 
 test("platformAsset maps supported release platforms", () => {
-  assert.equal(platformAsset("darwin", "arm64"), "agent-graph-darwin-arm64.gz");
-  assert.equal(platformAsset("linux", "x64"), "agent-graph-linux-x64.gz");
-  assert.equal(platformAsset("win32", "x64"), "agent-graph-win32-x64.gz");
+  assert.equal(platformAsset("darwin", "arm64"), "agent-atlas-darwin-arm64.gz");
+  assert.equal(platformAsset("linux", "x64"), "agent-atlas-linux-x64.gz");
+  assert.equal(platformAsset("win32", "x64"), "agent-atlas-win32-x64.gz");
 });
 
 test("platformAsset rejects unsupported release platforms", () => {
@@ -18,10 +18,10 @@ test("platformAsset rejects unsupported release platforms", () => {
 test("expectedChecksum finds GNU and BSD checksum entries", () => {
   const checksums = Buffer.from(
     "abc123\tother-file\n" +
-      "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef  agent-graph-linux-x64.gz\n"
+      "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef  agent-atlas-linux-x64.gz\n"
   );
   assert.equal(
-    expectedChecksum(checksums, "agent-graph-linux-x64.gz"),
+    expectedChecksum(checksums, "agent-atlas-linux-x64.gz"),
     "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
   );
 });

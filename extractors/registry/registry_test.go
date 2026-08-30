@@ -3,7 +3,7 @@ package registry
 import (
 	"testing"
 
-	"agent-graph/graph"
+	"agent-atlas/graph"
 )
 
 func TestDefaultSelectsIsolatedLanguageExtractors(t *testing.T) {
@@ -16,7 +16,7 @@ func TestDefaultSelectsIsolatedLanguageExtractors(t *testing.T) {
 		path string
 		name string
 	}{
-		{path: "cmd/agent-graph/main.go", name: "go"},
+		{path: "cmd/agent-atlas/main.go", name: "go"},
 		{path: "src/component.tsx", name: "typescript"},
 		{path: "src/server.mjs", name: "javascript"},
 	}
@@ -88,7 +88,7 @@ func TestDefaultGoExtractorExposesValidatedLanguageFacts(t *testing.T) {
 		t.Fatalf("create default registry: %v", err)
 	}
 
-	registered, ok := registry.ForPath("cmd/agent-graph/main.go")
+	registered, ok := registry.ForPath("cmd/agent-atlas/main.go")
 	if !ok {
 		t.Fatal("no Go extractor registered")
 	}
@@ -98,7 +98,7 @@ func TestDefaultGoExtractorExposesValidatedLanguageFacts(t *testing.T) {
 	}
 
 	evidence := graph.FactEvidence{
-		Span:       graph.SourceSpan{Path: "cmd/agent-graph/main.go", StartLine: 1, StartColumn: 1, EndLine: 1, EndColumn: 1},
+		Span:       graph.SourceSpan{Path: "cmd/agent-atlas/main.go", StartLine: 1, StartColumn: 1, EndLine: 1, EndColumn: 1},
 		FileHash:   "sha256:fixture",
 		Extractor:  "go",
 		Provenance: "static",

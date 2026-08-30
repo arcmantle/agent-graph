@@ -5,10 +5,10 @@ import (
 	"runtime"
 	"testing"
 
-	"agent-graph/extractor"
-	"agent-graph/extractors/registry"
-	"agent-graph/extractors/typescript"
-	"agent-graph/workspace"
+	"agent-atlas/extractor"
+	"agent-atlas/extractors/registry"
+	"agent-atlas/extractors/typescript"
+	"agent-atlas/workspace"
 )
 
 type blockingFirstContributionWriteSession struct {

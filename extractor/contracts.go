@@ -7,7 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 
-	"agent-graph/graph"
+	"agent-atlas/graph"
 )
 
 type Metadata struct {

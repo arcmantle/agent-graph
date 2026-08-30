@@ -9,7 +9,7 @@ import (
 	"strings"
 	"testing"
 
-	"agent-graph/testkit"
+	"agent-atlas/testkit"
 )
 
 func TestCommandRuns(t *testing.T) {
@@ -310,7 +310,7 @@ func TestBenchmarkCommandWritesIncrementalUpdateCPUProfile(t *testing.T) {
 
 func TestBenchmarkCommandMeasuresGoWorkspace(t *testing.T) {
 	workspace := testkit.NewWorkspace(t, map[string]string{
-		".agraphignore":    "reference/\n",
+		".atlasignore":    "reference/\n",
 		"go.mod":           "module example.com/fixture\n\ngo 1.24\n",
 		"cmd/main.go":      "package main\n\nimport \"example.com/fixture/service\"\n\nfunc main() { service.Run() }\n",
 		"service/run.go":   "package service\n\nfunc Run() {}\n",
@@ -434,7 +434,7 @@ func TestIndexCommandUsesWorkspaceLocalDatabaseByDefault(t *testing.T) {
 		t.Fatalf("run index command: %v\n%s", err, output)
 	}
 
-	database := filepath.Join(workspace.Root, ".agent-graph", "graph.db")
+	database := filepath.Join(workspace.Root, ".agent-atlas", "graph.db")
 	if _, err := os.Stat(database); err != nil {
 		t.Errorf("default database %q does not exist: %v", database, err)
 	}
@@ -826,7 +826,7 @@ func TestIndexerLifecycleCommandsControlBackgroundService(t *testing.T) {
 			t.Errorf("remove workspace: %v", err)
 		}
 	})
-	binary := filepath.Join(t.TempDir(), "agent-graph")
+	binary := filepath.Join(t.TempDir(), "agent-atlas")
 	build := exec.Command("go", "build", "-o", binary, ".")
 	if output, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("build command binary: %v\n%s", err, output)

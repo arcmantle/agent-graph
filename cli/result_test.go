@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"agent-graph/cli"
-	"agent-graph/storage"
+	"agent-atlas/cli"
+	"agent-atlas/storage"
 )
 
 func TestRenderTextIncludesSnapshotMetadata(t *testing.T) {

@@ -6,9 +6,9 @@ import (
 	"strings"
 	"testing"
 
-	"agent-graph/extractor"
-	"agent-graph/graph"
-	"agent-graph/storage"
+	"agent-atlas/extractor"
+	"agent-atlas/graph"
+	"agent-atlas/storage"
 )
 
 func TestContributionSessionRejectsWorkspaceFactLargerThanByteLimit(t *testing.T) {
