@@ -21,7 +21,7 @@ Linux x64, and macOS arm64. It requires Node.js 18 or later during installation.
 The release workflow runs when a signed-off version tag is pushed. It builds
 native binaries, creates a GitHub release and checksum manifest, then publishes
 the npm package. Before the first release, add an npm automation token with
-publish access for the `@arcmantle` scope as the repository `NPM_TOKEN` secret.
+publish access for both package names as the organization `NPM_PUBLISH` secret.
 
 The package version and Git tag must match:
 

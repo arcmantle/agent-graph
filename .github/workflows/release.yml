@@ -101,7 +101,8 @@ jobs:
       - name: Publish npm package
         working-directory: npm/agent-graph
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_PUBLISH }}
+          NPM_TOKEN: ${{ secrets.NPM_PUBLISH }}
         run: npm publish
       - name: Validate unscoped package version
         working-directory: npm/agent-graph-unscoped
@@ -116,5 +117,6 @@ jobs:
       - name: Publish unscoped npm package
         working-directory: npm/agent-graph-unscoped
         env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_PUBLISH }}
+          NPM_TOKEN: ${{ secrets.NPM_PUBLISH }}
         run: npm publish
