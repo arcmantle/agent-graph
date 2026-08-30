@@ -73,7 +73,11 @@ jobs:
         run: |
           cat release-assets/*.sha256 > release-assets/SHA256SUMS
           rm release-assets/*.sha256
-          gh release create "$TAG" --verify-tag --generate-notes release-assets/*
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" release-assets/* --clobber
+          else
+            gh release create "$TAG" --verify-tag --generate-notes release-assets/*
+          fi
 
   npm:
     needs: release
