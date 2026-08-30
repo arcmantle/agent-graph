@@ -225,6 +225,31 @@ func TestExtractProvidesConstantDynamicImportForResolution(t *testing.T) {
 	}
 }
 
+func TestExtractDoesNotTreatStringsInExportedDeclarationAsModuleReferences(t *testing.T) {
+	sources := map[string]string{
+		"class":         `export class Component { render() { return ["content"].join(""); } }`,
+		"function":      `export function render() { return "content"; }`,
+		"variable":      `export const content = "content";`,
+		"default class": `export default class Component { render() { return "content"; } }`,
+	}
+	for name, contents := range sources {
+		t.Run(name, func(t *testing.T) {
+			contribution, err := Extract(extractor.Source{
+				ProjectID:  "project:fixture",
+				SourcePath: "src/component.js",
+				Contents:   []byte(contents),
+			})
+			if err != nil {
+				t.Fatalf("extract JavaScript facts: %v", err)
+			}
+
+			if references := contribution.UnresolvedReferences(); len(references) != 0 {
+				t.Errorf("unresolved references = %+v, want none", references)
+			}
+		})
+	}
+}
+
 func TestExtractReportsUnboundedDynamicRequire(t *testing.T) {
 	contribution, err := Extract(extractor.Source{
 		ProjectID:  "project:fixture",

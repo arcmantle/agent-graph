@@ -413,6 +413,10 @@ func moduleReferenceKind(source extractor.Source, node *sitter.Node) (extractor.
 	case "import_statement":
 		return extractor.ModuleReferenceImport, true
 	case "export_statement":
+		// A declaration export has no source clause and re-exports nothing.
+		if node.ChildByFieldName("source") == nil {
+			return "", false
+		}
 		return extractor.ModuleReferenceReExport, true
 	case "call_expression":
 		function := node.ChildByFieldName("function")
@@ -467,22 +471,11 @@ func moduleSpecifiers(source extractor.Source, node *sitter.Node) ([]moduleSpeci
 }
 
 func staticModuleSpecifier(source extractor.Source, node *sitter.Node) (string, bool) {
-	var specifier *sitter.Node
-	var visit func(*sitter.Node)
-	visit = func(current *sitter.Node) {
-		if specifier != nil {
-			return
-		}
-		if current.Kind() == "string" {
-			specifier = current
-			return
-		}
-		for childIndex := uint(0); childIndex < current.NamedChildCount(); childIndex++ {
-			visit(current.NamedChild(childIndex))
-		}
+	specifier := node
+	if node.Kind() != "string" {
+		specifier = node.ChildByFieldName("source")
 	}
-	visit(node)
-	if specifier == nil {
+	if specifier == nil || specifier.Kind() != "string" {
 		return "", false
 	}
 
