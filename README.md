@@ -22,11 +22,11 @@ the npm package. Before the first release, add an npm automation token with
 publish access for `@arcmantle/agent-atlas` as the organization `NPM_PUBLISH`
 secret.
 
-The package version and Git tag must match:
+The release tag must match the version calculated by Prospector:
 
 ```bash
-git tag v0.1.0
-git push origin v0.1.0
+git tag vVERSION
+git push origin vVERSION
 ```
 
 It is intended to work beside `agent-issues`:
