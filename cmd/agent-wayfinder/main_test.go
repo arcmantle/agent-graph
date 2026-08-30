@@ -29,10 +29,83 @@ func TestCommandHelpListsPublicCommands(t *testing.T) {
 	}
 
 	output := standardOutput.String()
-	for _, command := range []string{"index", "query", "path", "explain", "export", "indexer", "benchmark"} {
+	for _, command := range []string{"install", "index", "query", "path", "explain", "export", "indexer", "benchmark"} {
 		if !strings.Contains(output, command) {
 			t.Errorf("help output = %q, want public command %q", output, command)
 		}
+	}
+}
+
+func TestInstallCommandWritesUserSkill(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	standardOutput := &strings.Builder{}
+	standardError := &strings.Builder{}
+
+	if exitCode := run([]string{"install"}, standardOutput, standardError); exitCode != 0 {
+		t.Fatalf("run install command: exit code %d, error %s", exitCode, standardError.String())
+	}
+
+	skillDirectory := filepath.Join(home, ".agents", "skills", "agent-wayfinder")
+	assertFileContains(t, filepath.Join(skillDirectory, "SKILL.md"), "name: agent-wayfinder")
+	assertFileContains(t, filepath.Join(skillDirectory, "references", "commands.md"), "# Agent Wayfinder Command Reference")
+	if output := standardOutput.String(); !strings.Contains(output, skillDirectory) {
+		t.Errorf("install output = %q, want destination %q", output, skillDirectory)
+	}
+
+	skillPath := filepath.Join(skillDirectory, "SKILL.md")
+	if err := os.WriteFile(skillPath, []byte("stale"), 0o644); err != nil {
+		t.Fatalf("write stale skill: %v", err)
+	}
+	if exitCode := run([]string{"install"}, &strings.Builder{}, standardError); exitCode != 0 {
+		t.Fatalf("update installed skill: exit code %d, error %s", exitCode, standardError.String())
+	}
+	assertFileContains(t, skillPath, "name: agent-wayfinder")
+}
+
+func TestInstallCommandWritesProjectSkill(t *testing.T) {
+	project := t.TempDir()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+	t.Chdir(project)
+	standardOutput := &strings.Builder{}
+	standardError := &strings.Builder{}
+
+	if exitCode := run([]string{"install", "--project"}, standardOutput, standardError); exitCode != 0 {
+		t.Fatalf("run project install command: exit code %d, error %s", exitCode, standardError.String())
+	}
+
+	skillDirectory := filepath.Join(project, ".agents", "skills", "agent-wayfinder")
+	assertFileContains(t, filepath.Join(skillDirectory, "SKILL.md"), "name: agent-wayfinder")
+	assertFileContains(t, filepath.Join(skillDirectory, "references", "commands.md"), "# Agent Wayfinder Command Reference")
+	if _, err := os.Stat(filepath.Join(home, ".agents", "skills", "agent-wayfinder", "SKILL.md")); !os.IsNotExist(err) {
+		t.Errorf("global skill exists after project install: %v", err)
+	}
+}
+
+func TestBundledSkillIncludesCommandReference(t *testing.T) {
+	skill, err := bundledSkill.ReadFile("skill_assets/SKILL.md")
+	if err != nil {
+		t.Fatalf("read bundled skill: %v", err)
+	}
+	if !strings.Contains(string(skill), "./references/commands.md") {
+		t.Errorf("bundled skill does not link to its command reference")
+	}
+	if _, err := bundledSkill.ReadFile("skill_assets/references/commands.md"); err != nil {
+		t.Fatalf("read bundled command reference: %v", err)
+	}
+}
+
+func assertFileContains(t *testing.T, path, expected string) {
+	t.Helper()
+	contents, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatalf("read %s: %v", path, err)
+	}
+	if !strings.Contains(string(contents), expected) {
+		t.Errorf("%s = %q, want text %q", path, contents, expected)
 	}
 }
 
@@ -310,7 +383,7 @@ func TestBenchmarkCommandWritesIncrementalUpdateCPUProfile(t *testing.T) {
 
 func TestBenchmarkCommandMeasuresGoWorkspace(t *testing.T) {
 	workspace := testkit.NewWorkspace(t, map[string]string{
-		".wayfinderignore":    "reference/\n",
+		".wayfinderignore": "reference/\n",
 		"go.mod":           "module example.com/fixture\n\ngo 1.24\n",
 		"cmd/main.go":      "package main\n\nimport \"example.com/fixture/service\"\n\nfunc main() { service.Run() }\n",
 		"service/run.go":   "package service\n\nfunc Run() {}\n",

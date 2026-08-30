@@ -8,6 +8,7 @@ Install the released command-line tool from npm:
 
 ```bash
 npm install --global agent-wayfinder
+agent-wayfinder install
 agent-wayfinder --help
 a-wayfinder --help
 ```
@@ -16,6 +17,16 @@ a-wayfinder --help
 
 The npm package downloads a checksum-verified native binary for Windows x64,
 Linux x64, and macOS arm64. It requires Node.js 18 or later during installation.
+
+## Agent Skill
+
+The project includes a cross-framework skill at
+[cmd/agent-wayfinder/skill_assets/SKILL.md](cmd/agent-wayfinder/skill_assets/SKILL.md).
+Run `agent-wayfinder install --project` to install the bundled copy in another
+project instead of the user-level default.
+Use `/agent-wayfinder` to index a workspace, query code relationships, trace a
+path, or explain a graph node. The skill queries the local graph first and then
+requires source inspection and focused validation before code changes.
 
 ## Publish A Release
 

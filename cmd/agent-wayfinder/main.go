@@ -70,6 +70,7 @@ func newRootCommand(standardOutput, standardError io.Writer) (*cobra.Command, *i
 	}
 
 	addCommand("benchmark [WORKSPACE]", "Measure critical graph operations", benchmarkFlags, runBenchmark)
+	addCommand("install", "Install the Agent Wayfinder skill", installFlags, runInstall)
 	addCommand("index WORKSPACE", "Index a workspace", databaseAndFormatFlags, runIndex)
 	addCommand("query WORKSPACE TERM...", "Query a published graph", queryFlags, runQuery)
 	root.AddCommand(newIndexerCommand(standardOutput, standardError, &exitCode))
