@@ -1,4 +1,4 @@
-module agent-atlas
+module agent-wayfinder
 
 go 1.25.0
 

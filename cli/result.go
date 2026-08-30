@@ -6,7 +6,7 @@ import (
 	"fmt"
 	"io"
 
-	"agent-atlas/storage"
+	"agent-wayfinder/storage"
 )
 
 type Format string

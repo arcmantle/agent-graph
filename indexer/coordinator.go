@@ -10,7 +10,7 @@ import (
 )
 
 const (
-	stateDirectory = ".agent-atlas"
+	stateDirectory = ".agent-wayfinder"
 	lockFileName   = "indexer.lock"
 	endpointName   = "indexer.sock"
 )

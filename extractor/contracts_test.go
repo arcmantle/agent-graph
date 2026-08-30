@@ -5,8 +5,8 @@ import (
 	"errors"
 	"testing"
 
-	"agent-atlas/extractor"
-	"agent-atlas/graph"
+	"agent-wayfinder/extractor"
+	"agent-wayfinder/graph"
 )
 
 func TestNewContributionAcceptsValidatedDatabaseNeutralData(t *testing.T) {

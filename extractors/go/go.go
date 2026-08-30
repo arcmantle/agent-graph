@@ -6,8 +6,8 @@ import (
 	"fmt"
 	"strconv"
 
-	"agent-atlas/extractor"
-	"agent-atlas/graph"
+	"agent-wayfinder/extractor"
+	"agent-wayfinder/graph"
 
 	sitter "github.com/tree-sitter/go-tree-sitter"
 	gogrammar "github.com/tree-sitter/tree-sitter-go/bindings/go"

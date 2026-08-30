@@ -3,7 +3,7 @@ package extractor
 import (
 	"context"
 
-	"agent-atlas/graph"
+	"agent-wayfinder/graph"
 )
 
 type pageResolverTargetResult struct {

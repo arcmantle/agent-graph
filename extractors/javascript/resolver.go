@@ -8,8 +8,8 @@ import (
 	"sort"
 	"strings"
 
-	"agent-atlas/extractor"
-	"agent-atlas/graph"
+	"agent-wayfinder/extractor"
+	"agent-wayfinder/graph"
 )
 
 const (

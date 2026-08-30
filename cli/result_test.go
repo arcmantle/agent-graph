@@ -7,8 +7,8 @@ import (
 	"testing"
 	"time"
 
-	"agent-atlas/cli"
-	"agent-atlas/storage"
+	"agent-wayfinder/cli"
+	"agent-wayfinder/storage"
 )
 
 func TestRenderTextIncludesSnapshotMetadata(t *testing.T) {

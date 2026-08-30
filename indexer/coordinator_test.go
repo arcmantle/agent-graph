@@ -9,7 +9,7 @@ import (
 	"testing"
 	"time"
 
-	"agent-atlas/indexer"
+	"agent-wayfinder/indexer"
 )
 
 func TestAcquireReusesLiveWorkspaceOwner(t *testing.T) {
@@ -33,14 +33,14 @@ func TestAcquireReusesLiveWorkspaceOwner(t *testing.T) {
 	if existing.Endpoint != owner.Endpoint() {
 		t.Errorf("existing owner endpoint = %q, want %q", existing.Endpoint, owner.Endpoint())
 	}
-	if owner.Endpoint() != filepath.Join(root, ".agent-atlas", "indexer.sock") {
+	if owner.Endpoint() != filepath.Join(root, ".agent-wayfinder", "indexer.sock") {
 		t.Errorf("owner endpoint = %q, want workspace-local endpoint", owner.Endpoint())
 	}
 }
 
 func TestAcquireRecoversStaleOwnerMetadata(t *testing.T) {
 	root := t.TempDir()
-	state := filepath.Join(root, ".agent-atlas")
+	state := filepath.Join(root, ".agent-wayfinder")
 	if err := os.MkdirAll(state, 0o755); err != nil {
 		t.Fatalf("create indexer state directory: %v", err)
 	}
@@ -57,14 +57,14 @@ func TestAcquireRecoversStaleOwnerMetadata(t *testing.T) {
 			t.Errorf("close recovered owner: %v", err)
 		}
 	})
-	if owner.Endpoint() != filepath.Join(root, ".agent-atlas", "indexer.sock") {
+	if owner.Endpoint() != filepath.Join(root, ".agent-wayfinder", "indexer.sock") {
 		t.Errorf("recovered owner endpoint = %q, want workspace-local endpoint", owner.Endpoint())
 	}
 }
 
 func TestAcquireRecoversCorruptStaleOwnerMetadata(t *testing.T) {
 	root := t.TempDir()
-	state := filepath.Join(root, ".agent-atlas")
+	state := filepath.Join(root, ".agent-wayfinder")
 	if err := os.MkdirAll(state, 0o755); err != nil {
 		t.Fatalf("create indexer state directory: %v", err)
 	}
@@ -126,7 +126,7 @@ func TestManagerStartsWorkspaceIndexerAndReportsStatus(t *testing.T) {
 	if status.Workspace != root {
 		t.Errorf("status workspace = %q, want %q", status.Workspace, root)
 	}
-	if status.Endpoint != filepath.Join(root, ".agent-atlas", "indexer.sock") {
+	if status.Endpoint != filepath.Join(root, ".agent-wayfinder", "indexer.sock") {
 		t.Errorf("status endpoint = %q, want workspace-local endpoint", status.Endpoint)
 	}
 	if status.Activity.IsZero() {

@@ -11,12 +11,12 @@ import (
 	"strings"
 	"testing"
 
-	"agent-atlas/extractor"
-	goextractor "agent-atlas/extractors/go"
-	"agent-atlas/extractors/typescript"
-	"agent-atlas/graph"
-	"agent-atlas/storage"
-	"agent-atlas/storage/sqlite"
+	"agent-wayfinder/extractor"
+	goextractor "agent-wayfinder/extractors/go"
+	"agent-wayfinder/extractors/typescript"
+	"agent-wayfinder/graph"
+	"agent-wayfinder/storage"
+	"agent-wayfinder/storage/sqlite"
 
 	_ "github.com/mattn/go-sqlite3"
 )

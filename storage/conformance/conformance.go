@@ -5,9 +5,9 @@ import (
 	"errors"
 	"testing"
 
-	"agent-atlas/extractor"
-	"agent-atlas/graph"
-	"agent-atlas/storage"
+	"agent-wayfinder/extractor"
+	"agent-wayfinder/graph"
+	"agent-wayfinder/storage"
 )
 
 type StoreFactory func(*testing.T) storage.Store

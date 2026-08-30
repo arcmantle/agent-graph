@@ -9,8 +9,8 @@ import (
 	"strconv"
 	"strings"
 
-	"agent-atlas/extractor"
-	"agent-atlas/graph"
+	"agent-wayfinder/extractor"
+	"agent-wayfinder/graph"
 
 	sitter "github.com/tree-sitter/go-tree-sitter"
 	typescriptgrammar "github.com/tree-sitter/tree-sitter-typescript/bindings/go"

@@ -4,8 +4,8 @@ import (
 	"context"
 	"testing"
 
-	"agent-atlas/extractor"
-	"agent-atlas/graph"
+	"agent-wayfinder/extractor"
+	"agent-wayfinder/graph"
 
 	sitter "github.com/tree-sitter/go-tree-sitter"
 )

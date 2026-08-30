@@ -7,8 +7,8 @@ import (
 	"strconv"
 	"strings"
 
-	"agent-atlas/extractor"
-	"agent-atlas/graph"
+	"agent-wayfinder/extractor"
+	"agent-wayfinder/graph"
 
 	sitter "github.com/tree-sitter/go-tree-sitter"
 	javascriptgrammar "github.com/tree-sitter/tree-sitter-javascript/bindings/go"

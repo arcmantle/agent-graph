@@ -9,11 +9,11 @@ import (
 	"testing"
 	"time"
 
-	"agent-atlas/benchmark"
-	"agent-atlas/graph"
-	"agent-atlas/index"
-	"agent-atlas/storage"
-	"agent-atlas/storage/sqlite"
+	"agent-wayfinder/benchmark"
+	"agent-wayfinder/graph"
+	"agent-wayfinder/index"
+	"agent-wayfinder/storage"
+	"agent-wayfinder/storage/sqlite"
 )
 
 func TestValidateAcceptsOneInLimitRun(t *testing.T) {

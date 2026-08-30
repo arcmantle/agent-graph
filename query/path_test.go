@@ -5,9 +5,9 @@ import (
 	"reflect"
 	"testing"
 
-	"agent-atlas/graph"
-	"agent-atlas/query"
-	"agent-atlas/storage"
+	"agent-wayfinder/graph"
+	"agent-wayfinder/query"
+	"agent-wayfinder/storage"
 )
 
 func TestFindPathSnapshotReturnsDirectedShortestPath(t *testing.T) {

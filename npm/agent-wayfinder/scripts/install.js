@@ -4,7 +4,7 @@ const https = require("node:https");
 const path = require("node:path");
 const zlib = require("node:zlib");
 
-const releaseBaseURL = "https://github.com/arcmantle/agent-atlas/releases/download";
+const releaseBaseURL = "https://github.com/arcmantle/agent-wayfinder/releases/download";
 
 function platformAsset(platform = process.platform, architecture = process.arch) {
   const supported = {
@@ -17,12 +17,12 @@ function platformAsset(platform = process.platform, architecture = process.arch)
     throw new Error(`Unsupported platform: ${platform}-${architecture}`);
   }
 
-  return `agent-atlas-${platform}-${architecture}.gz`;
+  return `agent-wayfinder-${platform}-${architecture}.gz`;
 }
 
 function download(url, redirects = 0) {
   return new Promise((resolve, reject) => {
-    const request = https.get(url, { headers: { "user-agent": "agent-atlas-npm-installer" } }, response => {
+    const request = https.get(url, { headers: { "user-agent": "agent-wayfinder-npm-installer" } }, response => {
       if (response.statusCode >= 300 && response.statusCode < 400 && response.headers.location) {
         response.resume();
         if (redirects === 5) {
@@ -73,7 +73,7 @@ async function install() {
     throw new Error(`Checksum mismatch for ${assetName}`);
   }
 
-  const binaryName = process.platform === "win32" ? "agent-atlas.exe" : "agent-atlas";
+  const binaryName = process.platform === "win32" ? "agent-wayfinder.exe" : "agent-wayfinder";
   const binaryPath = path.join(packageDirectory, "bin", binaryName);
   fs.writeFileSync(binaryPath, zlib.gunzipSync(compressedBinary), { mode: 0o755 });
   fs.chmodSync(binaryPath, 0o755);
@@ -81,7 +81,7 @@ async function install() {
 
 if (require.main === module) {
   install().catch(error => {
-    console.error(`agent-atlas installation failed: ${error.message}`);
+    console.error(`agent-wayfinder installation failed: ${error.message}`);
     process.exitCode = 1;
   });
 }

@@ -7,14 +7,14 @@ import (
 	"reflect"
 	"testing"
 
-	"agent-atlas/testkit"
-	"agent-atlas/workspace"
+	"agent-wayfinder/testkit"
+	"agent-wayfinder/workspace"
 )
 
 func TestDiscoverStreamMatchesMaterializedProjectOwnershipIgnoreRulesAndOrder(t *testing.T) {
 	fixture := testkit.NewWorkspace(t, map[string]string{
 		"package.json":                        `{"name":"root"}`,
-		".atlasignore":                       "generated/\n!generated/keep.ts\n",
+		".wayfinderignore":                       "generated/\n!generated/keep.ts\n",
 		"src/root.ts":                         "export const root = 1;\n",
 		"generated/drop.ts":                   "export const drop = 1;\n",
 		"generated/keep.ts":                   "export const keep = 1;\n",
@@ -178,16 +178,16 @@ func TestDiscoverUsesTypeScriptAndJavaScriptManifestsWithOneIdentityPerRoot(t *t
 func TestDiscoverAppliesRootAgraphignorePatterns(t *testing.T) {
 	fixture := testkit.NewWorkspace(t, map[string]string{
 		"package.json":                  `{"name":"root"}`,
-		".atlasignore":                 "# generated files\ngenerated/\n*.test.ts\n/root-only.ts\n!generated/keep.ts\n",
+		".wayfinderignore":                 "# generated files\ngenerated/\n*.test.ts\n/root-only.ts\n!generated/keep.ts\n",
 		"root-only.ts":                  "export const rootOnly = 1;\n",
 		"src/main.ts":                   "export const main = 1;\n",
 		"src/main.test.ts":              "export const test = 1;\n",
 		"generated/build.ts":            "export const build = 1;\n",
 		"generated/keep.ts":             "export const keep = 1;\n",
-		"nested/.atlasignore":          "*.ts\n",
+		"nested/.wayfinderignore":          "*.ts\n",
 		"nested/still-included.ts":      "export const nested = 1;\n",
 		"node_modules/package/index.js": "module.exports = {};\n",
-		".agent-atlas/cache/index.ts":   "export const cache = 1;\n",
+		".agent-wayfinder/cache/index.ts":   "export const cache = 1;\n",
 		".git/hooks/ignored.ts":         "export const hook = 1;\n",
 	})
 
@@ -212,7 +212,7 @@ func TestDiscoverAppliesRootAgraphignorePatterns(t *testing.T) {
 func TestDiscoverAppliesRootRelativeDirectoryPatterns(t *testing.T) {
 	fixture := testkit.NewWorkspace(t, map[string]string{
 		"package.json":                       `{"name":"root"}`,
-		".atlasignore":                      "/generated/\n*.generated.ts\n!src/keep.generated.ts\n",
+		".wayfinderignore":                      "/generated/\n*.generated.ts\n!src/keep.generated.ts\n",
 		"generated/root.ts":                  "export const generated = 1;\n",
 		"packages/app/generated/retained.ts": "export const retained = 1;\n",
 		"src/drop.generated.ts":              "export const drop = 1;\n",
@@ -239,7 +239,7 @@ func TestDiscoverExcludesSourcesIgnoredByGit(t *testing.T) {
 	fixture := testkit.NewWorkspace(t, map[string]string{
 		"package.json":  `{"name":"root"}`,
 		".gitignore":    "dist/\n",
-		".atlasignore": "!core/dist/src/app/experimental/is-overflowing.d.ts\n",
+		".wayfinderignore": "!core/dist/src/app/experimental/is-overflowing.d.ts\n",
 		"core/dist/src/app/experimental/is-overflowing.d.ts": "export declare const isOverflowing: boolean;\n",
 		"core/src/app/experimental/is-overflowing.ts":        "export const isOverflowing = false;\n",
 	})
@@ -299,9 +299,9 @@ func TestDiscoverIncludesSourcesBelowGitIgnoreDirectoryRestoredByLaterRule(t *te
 }
 
 func TestDiscoverReportsClientFlexSourceCountWhenConfigured(t *testing.T) {
-	root := os.Getenv("AGENT_ATLAS_CLIENTFLEX_ROOT")
+	root := os.Getenv("AGENT_WAYFINDER_CLIENTFLEX_ROOT")
 	if root == "" {
-		t.Skip("set AGENT_ATLAS_CLIENTFLEX_ROOT to run the ClientFlex discovery test")
+		t.Skip("set AGENT_WAYFINDER_CLIENTFLEX_ROOT to run the ClientFlex discovery test")
 	}
 
 	discovery, err := workspace.Discover(root, workspace.DiscoverOptions{})

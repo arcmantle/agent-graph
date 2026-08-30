@@ -19,16 +19,16 @@ import (
 	"sync"
 	"time"
 
-	"agent-atlas/benchmark"
-	"agent-atlas/cli"
-	"agent-atlas/extractor"
-	"agent-atlas/graph"
-	"agent-atlas/index"
-	"agent-atlas/indexer"
-	"agent-atlas/query"
-	"agent-atlas/storage"
-	"agent-atlas/storage/sqlite"
-	"agent-atlas/workspace"
+	"agent-wayfinder/benchmark"
+	"agent-wayfinder/cli"
+	"agent-wayfinder/extractor"
+	"agent-wayfinder/graph"
+	"agent-wayfinder/index"
+	"agent-wayfinder/indexer"
+	"agent-wayfinder/query"
+	"agent-wayfinder/storage"
+	"agent-wayfinder/storage/sqlite"
+	"agent-wayfinder/workspace"
 
 	"github.com/spf13/cobra"
 )
@@ -49,7 +49,7 @@ func run(arguments []string, standardOutput, standardError io.Writer) int {
 func newRootCommand(standardOutput, standardError io.Writer) (*cobra.Command, *int) {
 	exitCode := 0
 	root := &cobra.Command{
-		Use:           "agent-atlas",
+		Use:           "agent-wayfinder",
 		Short:         "Index and query a local code graph",
 		SilenceErrors: true,
 		SilenceUsage:  true,
@@ -449,7 +449,7 @@ func runBenchmark(command *cobra.Command, arguments []string, standardOutput, st
 		}
 		fmt.Fprintf(standardError, "Benchmark setup: measure %d workspace source files\n", corpus.SourceFiles)
 	}
-	stateDirectory, err := os.MkdirTemp("", "agent-atlas-benchmark-state-")
+	stateDirectory, err := os.MkdirTemp("", "agent-wayfinder-benchmark-state-")
 	if err != nil {
 		return writeCommandError(standardError, fmt.Errorf("create benchmark state directory: %w", err))
 	}
@@ -685,7 +685,7 @@ func prepareWorkspaceBenchmark(root string) (string, benchmark.Corpus, error) {
 }
 
 func prepareBenchmarkCorpus(specification benchmark.CorpusSpec, standardError io.Writer) (string, benchmark.Corpus, error) {
-	workspace, err := os.MkdirTemp("", "agent-atlas-benchmark-")
+	workspace, err := os.MkdirTemp("", "agent-wayfinder-benchmark-")
 	if err != nil {
 		return "", benchmark.Corpus{}, fmt.Errorf("create benchmark workspace: %w", err)
 	}
@@ -701,7 +701,7 @@ func prepareBenchmarkCorpus(specification benchmark.CorpusSpec, standardError io
 		os.RemoveAll(workspace)
 		return "", benchmark.Corpus{}, err
 	}
-	if err := os.MkdirAll(filepath.Join(workspace, ".agent-atlas"), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Join(workspace, ".agent-wayfinder"), 0o755); err != nil {
 		os.RemoveAll(workspace)
 		return "", benchmark.Corpus{}, fmt.Errorf("create benchmark database directory: %w", err)
 	}
@@ -715,7 +715,7 @@ func prepareRealisticBenchmarkCorpus(sourceFiles int, standardError io.Writer) (
 	if err != nil {
 		return "", benchmark.Corpus{}, cli.NewInvalidArgumentError(err.Error())
 	}
-	workspace, err := os.MkdirTemp("", "agent-atlas-benchmark-")
+	workspace, err := os.MkdirTemp("", "agent-wayfinder-benchmark-")
 	if err != nil {
 		return "", benchmark.Corpus{}, fmt.Errorf("create benchmark workspace: %w", err)
 	}
@@ -731,7 +731,7 @@ func prepareRealisticBenchmarkCorpus(sourceFiles int, standardError io.Writer) (
 		os.RemoveAll(workspace)
 		return "", benchmark.Corpus{}, err
 	}
-	if err := os.MkdirAll(filepath.Join(workspace, ".agent-atlas"), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Join(workspace, ".agent-wayfinder"), 0o755); err != nil {
 		os.RemoveAll(workspace)
 		return "", benchmark.Corpus{}, fmt.Errorf("create benchmark database directory: %w", err)
 	}
@@ -1694,7 +1694,7 @@ func databasePath(workspace, database string) (string, error) {
 		return "", err
 	}
 	if database == "" {
-		return filepath.Join(workspaceRoot, ".agent-atlas", "graph.db"), nil
+		return filepath.Join(workspaceRoot, ".agent-wayfinder", "graph.db"), nil
 	}
 	return filepath.Abs(database)
 }

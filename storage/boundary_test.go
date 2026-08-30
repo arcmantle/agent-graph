@@ -4,7 +4,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"agent-atlas/testkit"
+	"agent-wayfinder/testkit"
 )
 
 func TestOnlySQLiteAdapterUsesSQLiteImplementationDetails(t *testing.T) {

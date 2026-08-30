@@ -10,7 +10,7 @@ import (
 	"strings"
 )
 
-// RunGraphifyComparisonCorpus compares an agent-atlas JSON export with the
+// RunGraphifyComparisonCorpus compares an agent-wayfinder JSON export with the
 // stored Graphify-compatible facts for one supported corpus.
 func RunGraphifyComparisonCorpus(name string, candidate []byte) error {
 	reference, err := os.ReadFile(filepath.Join("testdata", "graphify", name+".json"))
@@ -20,7 +20,7 @@ func RunGraphifyComparisonCorpus(name string, candidate []byte) error {
 
 	normalizedCandidate, err := NormalizeGraphifyExport(candidate)
 	if err != nil {
-		return fmt.Errorf("normalize agent-atlas export: %w", err)
+		return fmt.Errorf("normalize agent-wayfinder export: %w", err)
 	}
 	if err := CompareJSON(reference, normalizedCandidate); err != nil {
 		return fmt.Errorf("compare Graphify corpus %q: %w", name, err)
@@ -38,7 +38,7 @@ func RunGraphifyIndexComparisonCorpus(name string, candidate []byte) error {
 
 	normalizedCandidate, err := NormalizeGraphifyIndexResult(candidate)
 	if err != nil {
-		return fmt.Errorf("normalize agent-atlas index result: %w", err)
+		return fmt.Errorf("normalize agent-wayfinder index result: %w", err)
 	}
 	if err := CompareJSON(reference, normalizedCandidate); err != nil {
 		return fmt.Errorf("compare Graphify index corpus %q: %w", name, err)
@@ -46,7 +46,7 @@ func RunGraphifyIndexComparisonCorpus(name string, candidate []byte) error {
 	return nil
 }
 
-// NormalizeGraphifyExport converts agent-atlas storage identifiers into the
+// NormalizeGraphifyExport converts agent-wayfinder storage identifiers into the
 // source-based identities that Graphify exposes for supported facts.
 func NormalizeGraphifyExport(input []byte) ([]byte, error) {
 	decoder := json.NewDecoder(bytes.NewReader(input))

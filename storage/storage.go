@@ -5,8 +5,8 @@ import (
 	"errors"
 	"time"
 
-	"agent-atlas/extractor"
-	"agent-atlas/graph"
+	"agent-wayfinder/extractor"
+	"agent-wayfinder/graph"
 )
 
 var (

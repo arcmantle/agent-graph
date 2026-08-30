@@ -12,9 +12,9 @@ import (
 	"sync"
 	"time"
 
-	"agent-atlas/extractor"
-	"agent-atlas/graph"
-	"agent-atlas/storage"
+	"agent-wayfinder/extractor"
+	"agent-wayfinder/graph"
+	"agent-wayfinder/storage"
 
 	"github.com/mattn/go-sqlite3"
 )

@@ -4,9 +4,9 @@ import (
 	"context"
 	"testing"
 
-	"agent-atlas/graph"
-	"agent-atlas/query"
-	"agent-atlas/storage"
+	"agent-wayfinder/graph"
+	"agent-wayfinder/query"
+	"agent-wayfinder/storage"
 )
 
 func TestQuerySnapshotReportsExternalProjectScopeBoundary(t *testing.T) {

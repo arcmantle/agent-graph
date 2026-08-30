@@ -15,15 +15,15 @@ import (
 	"testing"
 	"time"
 
-	"agent-atlas/graph"
-	"agent-atlas/index"
-	"agent-atlas/query"
-	"agent-atlas/storage"
-	"agent-atlas/storage/sqlite"
-	"agent-atlas/workspace"
+	"agent-wayfinder/graph"
+	"agent-wayfinder/index"
+	"agent-wayfinder/query"
+	"agent-wayfinder/storage"
+	"agent-wayfinder/storage/sqlite"
+	"agent-wayfinder/workspace"
 )
 
-const clientFlexRootEnvironment = "AGENT_ATLAS_CLIENTFLEX_ROOT"
+const clientFlexRootEnvironment = "AGENT_WAYFINDER_CLIENTFLEX_ROOT"
 
 const clientFlexAuthInfoQualifiedName = "core-auth/src/auth-info.ts::AuthInfo"
 const clientFlexAuthIndexPath = "core-auth/src/index.ts"

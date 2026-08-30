@@ -10,14 +10,14 @@ import (
 	"sync"
 	"time"
 
-	"agent-atlas/extractor"
-	goextractor "agent-atlas/extractors/go"
-	"agent-atlas/extractors/javascript"
-	"agent-atlas/extractors/registry"
-	"agent-atlas/extractors/typescript"
-	"agent-atlas/graph"
-	"agent-atlas/storage"
-	"agent-atlas/workspace"
+	"agent-wayfinder/extractor"
+	goextractor "agent-wayfinder/extractors/go"
+	"agent-wayfinder/extractors/javascript"
+	"agent-wayfinder/extractors/registry"
+	"agent-wayfinder/extractors/typescript"
+	"agent-wayfinder/graph"
+	"agent-wayfinder/storage"
+	"agent-wayfinder/workspace"
 )
 
 type contributionExtractor func(string, workspace.Source, registry.Registry, *typescript.Worker) (extractedSource, error)
